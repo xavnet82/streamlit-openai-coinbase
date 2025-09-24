@@ -116,24 +116,27 @@ def compute_trends(df: pd.DataFrame) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=900)
 def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        raise RuntimeError("No hay datos de mercado para el símbolo solicitado.")
-    # Normalización: índice, tipos numéricos y limpieza de NaN
-    if isinstance(df.index, pd.DatetimeIndex):
-        try:
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-        except Exception:
-            pass
-    else:
+    df = yf.download(symbol, period=period, interval=interval,
+                     auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"No hay datos de mercado para {symbol} con periodo={period}, interval={interval}")
+    
+    # Normalizar índice
+    if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
-    # Asegurar tipos numéricos
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    # Forzar numérico en OHLCV
+    for col in ["Open","High","Low","Close","Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+    
+    df = df.dropna(subset=["Open","High","Low","Close"]).sort_index()
+    if df.empty:
+        raise RuntimeError(f"Datos no válidos para {symbol}")
     return df
+
 
 # -------------------------------
 # Modelos de datos (Pydantic)
