@@ -1,13 +1,16 @@
-# Streamlit + OpenAI + Coinbase Advanced Trade
+# Streamlit + OpenAI + Coinbase (UI enriquecida + KPIs reales)
 
-App de ejemplo que:
-1. Solicita un **activo** (product_id de Coinbase: p.ej. `BTC-USD`).
-2. Llama a **OpenAI** (modelo configurable) para obtener un **análisis detallado** y una **recomendación estructurada** (`buy/sell/hold`).
-3. Si procede, permite **lanzar una orden de mercado** en Coinbase Advanced Trade (BUY con `quote_size` USD o SELL con `base_size`).
+Incluye:
+- Obtención de **precio spot** y **velas 1H** (24–48h) desde Coinbase Advanced Trade (endpoints públicos).
+- Cálculo de **KPIs** (RSI 14, MACD 12-26-9 diff, Δ Precio 24h, Δ Volumen 24h, Volatilidad 24h).
+- **Tendencias** (6h/24h/48h) y **% de recomendación** (buy/hold/sell).
+- Llamada a OpenAI con **Structured Outputs** (JSON Schema estricto).
 
-> **Aviso**: Esto es una demo educativa. No es asesoramiento financiero. Verifica siempre antes de operar.
+Documentación relevante:
+- Ticker público (best_bid/ask y trades): Get Public Market Trades. 
+- Velas públicas (candles 1H): Get Public Product Candles.
 
-## 🚀 Puesta en marcha (local)
+## Puesta en marcha
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -15,46 +18,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-### 🔐 Configurar secretos
+Configura `.streamlit/secrets.toml` con tus claves.
 
-Crea `.streamlit/secrets.toml` (no lo subas a GitHub) con:
-
-```toml
-# OpenAI
-OPENAI_API_KEY = "sk-..."
-OPENAI_MODEL = "gpt-4.1-mini"  # o el modelo que prefieras soportado por Structured Outputs
-
-# Coinbase (CDP)
-COINBASE_API_KEY = "organizations/{org_id}/apiKeys/{key_id}"
-# Pega tu clave privada ECDSA multilínea tal cual, por ejemplo:
-# COINBASE_API_SECRET = """-----BEGIN EC PRIVATE KEY-----
-# ...TU_LLAVE_PRIVADA_ECDSA...
-# -----END EC PRIVATE KEY-----"""
-# (Las comillas triples deben permanecer para preservar saltos de línea)
-
-# Opcional: Sandbox
-USE_SANDBOX = true
-COINBASE_BASE_URL = "api-sandbox.coinbase.com" # producción = api.coinbase.com
-
-# Por defecto
-DEFAULT_PRODUCT_ID = "BTC-USD"
-```
-
-> **Sandbox** de Advanced Trade: host `api-sandbox.coinbase.com` con respuestas **estáticas** para endpoints de **Accounts y Orders** (mismo formato que producción).
-
-## ☁️ Despliegue en Streamlit Community Cloud
-
-1. Sube el repo a **GitHub**.
-2. En https://share.streamlit.io/ crea una app con `app.py`.
-3. En **Settings → Secrets**, copia las mismas claves de `secrets.toml`.
-4. Despliega.
-
-## 📦 Notas técnicas
-
-- La app usa **Structured Outputs** (JSON Schema) para obtener un objeto `TradeSignal` válido y fácil de parsear.
-- Para **BUY** se usa `quote_size` (USD en pares `*-USD`). Para **SELL** se usa `base_size` (cantidad de cripto).
-- El SDK oficial `coinbase-advanced-py` maneja la firma **JWT CDP** y expone métodos como `get_product`, `market_order_buy`, `market_order_sell`.
-
-## ⚖️ Licencia
-
-MIT (solo para el contenido de este repo). Consulta licencias de dependencias por separado.
+## Notas
+- Para sandbox usa `COINBASE_BASE_URL = "api-sandbox.coinbase.com"` y `USE_SANDBOX = true`.
+- Para ejecutar órdenes necesitas `COINBASE_API_KEY` y `COINBASE_API_SECRET` (CDP).
