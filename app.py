@@ -15,6 +15,7 @@ from openai import OpenAI
 
 # Plotly for advanced visuals
 import plotly.graph_objects as go
+import backtesting
 
 # ---------- Page & Global Styles ----------
 st.set_page_config(page_title="Any-Asset Trading Assistant (OpenAI + 1Y Daily)", page_icon="📊", layout="wide")
@@ -336,6 +337,23 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict) -> Trade
         dist.sell = float(dist.sell)/s
     return ts
 
+def _gauge_score_from_dist(dist, action: str) -> int:
+    try:
+        b = float(getattr(dist, "buy", 0.0))
+        h = float(getattr(dist, "hold", 0.0))
+        s = float(getattr(dist, "sell", 0.0))
+        total = b + h + s
+        if total > 0:
+            b /= total; s /= total
+            score = int(round((b - s) * 100))
+        else:
+            raise ValueError("zero total")
+    except Exception:
+        mapping = {"buy": 75, "hold": 0, "sell": -75}
+        score = mapping.get((action or "hold").lower(), 0)
+    return max(-100, min(100, score))
+
+
 # ---------- UI ----------
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
@@ -372,6 +390,7 @@ if "df" in st.session_state:
     kpis = st.session_state["kpis"]
     trends = st.session_state["trends"]
     ts = st.session_state.get("signal")
+    parsed = TradeSignal(**ts) if isinstance(ts, dict) and ts else (ts if ts else None)
 
     # HERO DASHBOARD
     last_price = float(df["Close"].iloc[-1])
@@ -382,30 +401,27 @@ if "df" in st.session_state:
         c1, c2, c3, c4 = st.columns([1.2,1,1,1])
         if ts:
             parsed = TradeSignal(**ts) if isinstance(ts, dict) else ts
-             dist = parsed.recommendation_distribution
-                b = float(dist.buy or 0.0); h = float(dist.hold or 0.0); s = float(dist.sell or 0.0)
-                total = b + h + s
-                if total <= 0:
-                    total = 1.0
-                net = ((b - s) / total) * 100.0          # -100 (sell puro) … +100 (buy puro)
-                score = max(-100.0, min(100.0, net))     # clamp
-                
-                fig = go.Figure(go.Indicator(
-                    mode="gauge+number+delta",
-                    value=score,
-                    gauge={
-                        "axis": {"range": [-100, 100]},
-                        "bar": {"color": "#2B59C3"},
-                        "steps": [
-                            {"range": [-100, -33], "color": "#fee2e2"},
-                            {"range": [-33, 33],  "color": "#fef9c3"},
-                            {"range": [33, 100],  "color": "#dcfce7"},
-                        ],
-                        "threshold": {"line": {"width": 0}, "thickness": 0.0, "value": 0}  # referencia visual implícita
-                    },
-                    title={"text": f"R
+            dist = parsed.recommendation_distribution
+            score = _gauge_score_from_dist(dist, parsed.action)  # robust mapping
+            fig = go.Figure(go.Indicator(
+                mode = "gauge+number+delta",
+                value = score,
+                gauge = {
+                    "axis": {"range": [-100,100]},
+                    "bar": {"color": "#2B59C3"},
+                    "steps": [
+                        {"range": [-100,-33], "color":"#fee2e2"},
+                        {"range": [-33,33], "color":"#fef9c3"},
+                        {"range": [33,100], "color":"#dcfce7"},
+                    ]
+                },
+                title = {"text": f"Recomendación • {parsed.action.upper()}"},
+                number = {"suffix": ""},
+                delta = {"reference": 0}
+            ))
             fig.update_layout(height=260, margin=dict(l=10,r=10,t=30,b=10))
             c1.plotly_chart(fig, use_container_width=True)
+            c1.caption(f"Distribución BUY/HOLD/SELL: {dist.buy:.2f} / {dist.hold:.2f} / {dist.sell:.2f}")
         else:
             c1.info("Ejecuta el análisis para ver la recomendación.")
 
@@ -450,7 +466,7 @@ if "df" in st.session_state:
     k6.metric("% vs MA200", kpis["pct_from_ma200"])
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Gráfico", "🧭 Estrategia (OpenAI)", "🧮 KPIs & Tendencias", "📄 Datos"])
+    tab1, tab2, tab_bt, tab3, tab4 = st.tabs(["📈 Gráfico", "🧭 Estrategia (OpenAI)", "🔁 Backtesting", "🧮 KPIs & Tendencias", "📄 Datos"])
 
     with tab1:
         try:
@@ -504,6 +520,96 @@ if "df" in st.session_state:
             st.markdown("#### Análisis detallado")
             st.write(parsed.analysis)
             st.info(f"**Rationale:** {parsed.rationale}")
+   
+    with tab_bt:
+      st.subheader("Simulador de estrategias (Backtesting)")
+      if "df" not in st.session_state:
+          st.info("Primero ejecuta un análisis para cargar datos del activo.")
+      else:
+          df_bt = df.copy()
+          # Selector de rango temporal
+          min_date = df_bt.index.min()
+          max_date = df_bt.index.max()
+          r = st.slider("Rango temporal",
+                        min_value=min_date.to_pydatetime(),
+                        max_value=max_date.to_pydatetime(),
+                        value=(min_date.to_pydatetime(), max_date.to_pydatetime()))
+          start_d, end_d = pd.Timestamp(r[0]), pd.Timestamp(r[1])
+          df_bt = df_bt.loc[(df_bt.index >= start_d) & (df_bt.index <= end_d)].copy()
+          if df_bt.empty:
+              st.warning("No hay datos en el rango seleccionado.")
+          else:
+              # Parámetros de reglas
+              st.markdown("**Reglas de señal (KPI):**")
+              c1, c2, c3 = st.columns(3)
+              with c1:
+                  use_rsi = st.checkbox("Usar RSI", value=True)
+                  rsi_buy = st.number_input("RSI BUY <", value=30.0, min_value=1.0, max_value=50.0, step=0.5)
+                  rsi_sell = st.number_input("RSI SELL >", value=70.0, min_value=50.0, max_value=99.0, step=0.5)
+              with c2:
+                  use_ma_cross = st.checkbox("Cruce MAs", value=True)
+                  fast_ma = st.number_input("MA rápida", value=20, min_value=2, max_value=100, step=1)
+                  slow_ma = st.number_input("MA lenta", value=50, min_value=5, max_value=400, step=1)
+              with c3:
+                  sl_pct = st.number_input("Stop-Loss (%)", value=3.0, min_value=0.1, max_value=50.0, step=0.1) / 100.0
+                  tp_pct = st.number_input("Take-Profit (%)", value=6.0, min_value=0.1, max_value=200.0, step=0.1) / 100.0
+                  fee_bps = st.number_input("Comisión (bps)", value=5, min_value=0, max_value=100, step=1)
+  
+              st.markdown("---")
+              oa_vet = st.checkbox("Validar/ajustar señales con OpenAI (puede consumir créditos)", value=False)
+              run_bt = st.button("▶️ Ejecutar backtest", use_container_width=True)
+  
+              if run_bt:
+                  # Generar señales base
+                  sigs = backtesting.generate_signals(df_bt, use_rsi, rsi_buy, rsi_sell, use_ma_cross, int(fast_ma), int(slow_ma))
+                  st.write(f"Señales generadas: {len(sigs)}")
+  
+                  decisions = None
+                  if oa_vet:
+                      try:
+                          decisions = backtesting.openai_vet_signals(
+                              oa_client, os.getenv("OPENAI_MODEL", OPENAI_MODEL), symbol, df_bt, sigs
+                          )
+                      except Exception as e:
+                          st.warning(f"No se pudo consultar OpenAI para validar señales: {e}")
+  
+                  trades_df, eq_df = backtesting.simulate(
+                      df_bt, sigs, sl_pct, tp_pct, capital=10000.0, fee_pct=fee_bps/10000.0,
+                      use_openai_decisions=decisions
+                  )
+                  summary = backtesting.summarize(trades_df, eq_df)
+  
+                  
+                  try:
+                      fig_sig = backtesting.plot_signals_candles(df_bt, sigs, trades_df)
+                      st.plotly_chart(fig_sig, use_container_width=True)
+                  except Exception as e:
+                      st.warning(f"No se pudo generar el gráfico de señales: {e}")
+        # Resultados
+                  m1, m2, m3, m4, m5, m6 = st.columns(6)
+                  m1.metric("Trades", summary["trades"])
+                  m2.metric("Win rate", f'{summary["win_rate"]*100:.1f}%')
+                  m3.metric("Avg win", f'{summary["avg_win"]*100:.2f}%')
+                  m4.metric("Avg loss", f'{summary["avg_loss"]*100:.2f}%')
+                  m5.metric("Total return", f'{summary["total_return"]*100:.2f}%')
+                  m6.metric("Max DD", f'{summary["max_drawdown"]*100:.2f}%')
+                  st.caption(f"Sharpe aprox.: {summary['sharpe']:.2f}")
+  
+                  # Curva de equity
+                  import plotly.graph_objects as go
+                  if not eq_df.empty:
+                      eq_fig = go.Figure(go.Scatter(x=eq_df['date'], y=eq_df['equity'], mode='lines', name='Equity'))
+                      eq_fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10))
+                      st.plotly_chart(eq_fig, use_container_width=True)
+  
+                  # Detalle de trades
+                  if not trades_df.empty:
+                      st.markdown("#### Detalle de operaciones")
+                      tdf = trades_df.copy()
+                      tdf["pnl_pct"] = (tdf["pnl_pct"]*100).round(2)
+                      st.dataframe(tdf, use_container_width=True)
+                  else:
+                      st.info("No se generaron operaciones para las reglas y el rango seleccionados.")
 
     with tab3:
         kpi_rows = [

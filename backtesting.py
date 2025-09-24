@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -226,3 +228,47 @@ def summarize(trades_df: pd.DataFrame, eq_df: pd.DataFrame) -> Dict[str, Any]:
     out["max_drawdown"] = float(max_drawdown(eq_df['equity']))
     out["sharpe"] = float(sharpe(daily))
     return out
+
+# ---------- Visualization ----------
+def plot_signals_candles(df: pd.DataFrame, signals: List[Signal], trades_df: Optional[pd.DataFrame] = None):
+    import plotly.graph_objects as go
+    import pandas as pd
+
+    fig = go.Figure(data=[
+        go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="OHLC")
+    ])
+
+    # Señales
+    if signals:
+        buy_pts_x = [s.date for s in signals if s.side == "buy" and s.date in df.index]
+        buy_pts_y = [float(df.loc[d, "Low"]) * 0.995 for d in buy_pts_x]
+        if buy_pts_x:
+            fig.add_trace(go.Scatter(x=buy_pts_x, y=buy_pts_y, mode="markers",
+                                     marker=dict(symbol="triangle-up", size=11), name="BUY signals"))
+        sell_pts_x = [s.date for s in signals if s.side == "sell" and s.date in df.index]
+        sell_pts_y = [float(df.loc[d, "High"]) * 1.005 for d in sell_pts_x]
+        if sell_pts_x:
+            fig.add_trace(go.Scatter(x=sell_pts_x, y=sell_pts_y, mode="markers",
+                                     marker=dict(symbol="triangle-down", size=11), name="SELL signals"))
+
+    # Trades
+    if trades_df is not None and not trades_df.empty:
+        tdf = trades_df.copy()
+        tdf["entry_date"] = pd.to_datetime(tdf["entry_date"])
+        tdf["exit_date"]  = pd.to_datetime(tdf["exit_date"])
+        for _, row in tdf.iterrows():
+            fig.add_vrect(x0=row["entry_date"], x1=row["exit_date"],
+                          fillcolor="LightGreen" if row["pnl_pct"]>0 else "MistyRose",
+                          opacity=0.2, layer="below", line_width=0)
+            fig.add_vline(x=row["entry_date"], line_width=1, line_dash="dot")
+            fig.add_vline(x=row["exit_date"],  line_width=1, line_dash="dash")
+            fig.add_trace(go.Scatter(x=[row["entry_date"]], y=[row["entry_price"]],
+                                     mode="markers+text", text=["Entry"], textposition="top center",
+                                     marker=dict(symbol="star", size=10), name="Entry", showlegend=False))
+            fig.add_trace(go.Scatter(x=[row["exit_date"]], y=[row["exit_price"]],
+                                     mode="markers+text", text=["Exit"], textposition="bottom center",
+                                     marker=dict(symbol="diamond", size=10), name="Exit", showlegend=False))
+
+    fig.update_layout(xaxis_rangeslider_visible=False, height=520, margin=dict(l=10, r=10, t=30, b=10))
+    return fig
+
