@@ -1,9 +1,9 @@
-# app.py (UI enriquecida + contexto de mercado real con Coinbase)
+# app.py (precio actual + tendencias 3/6/12M + manejo robusto de errores)
 import os
 import uuid
 import json
 import time
-from typing import Literal, Optional, List, Dict, Tuple
+from typing import Literal, Optional, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,6 @@ st.title("📈 Trading Assistant — OpenAI + Coinbase Advanced Trade")
 # ---------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 OPENAI_MODEL   = st.secrets.get("OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
-# Coinbase CDP keys (for signed calls; recomendadas también para endpoints públicos)
 CB_API_KEY     = st.secrets.get("COINBASE_API_KEY", os.getenv("COINBASE_API_KEY"))
 CB_API_SECRET  = st.secrets.get("COINBASE_API_SECRET", os.getenv("COINBASE_API_SECRET"))
 CB_BASE_URL    = st.secrets.get("COINBASE_BASE_URL", os.getenv("COINBASE_BASE_URL", "api.coinbase.com"))
@@ -101,12 +100,19 @@ def _enforce_no_additional_props(schema: dict):
             _enforce_no_additional_props(item)
 
 # ---------------------
-# Coinbase helpers (spot + candles + KPIs)
+# Coinbase helpers (robust price + candles)
 # ---------------------
 def get_spot_price(pid: str) -> Optional[float]:
-    """
-    Usa 'Get Public Market Trades' (ticker) para estimar spot como mid-price (best_bid/ask) o último trade.
-    """
+    """Intento robusto: get_product.price -> public market trades (mid) -> None"""
+    # 1) product.price
+    try:
+        p = cb_client.get_product(pid)
+        price = getattr(p, "price", None) or (p.get("price") if isinstance(p, dict) else None)
+        if price is not None:
+            return float(price)
+    except Exception as e:
+        st.debug(f"get_product error: {e}")
+    # 2) public market trades
     try:
         resp = cb_client.get_public_market_trades(product_id=pid, limit=1)
         best_bid = getattr(resp, "best_bid", None) or (resp.get("best_bid") if isinstance(resp, dict) else None)
@@ -118,14 +124,9 @@ def get_spot_price(pid: str) -> Optional[float]:
             last = trades[0]
             price = getattr(last, "price", None) or (last.get("price") if isinstance(last, dict) else None)
             if price: return float(price)
-    except Exception:
-        pass
-    try:
-        p = cb_client.get_product(pid)
-        price = getattr(p, "price", None) or (p.get("price") if isinstance(p, dict) else None)
-        return float(price) if price else None
-    except Exception:
-        return None
+    except Exception as e:
+        st.debug(f"get_public_market_trades error: {e}")
+    return None
 
 def _candles_to_df(candles: List[Dict]) -> pd.DataFrame:
     rows = []
@@ -142,19 +143,37 @@ def _candles_to_df(candles: List[Dict]) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["start"], unit="s", utc=True)
     return df
 
-def get_candles(pid: str, start_ts: int, end_ts: int, granularity: str="ONE_HOUR", limit: int=350) -> Optional[pd.DataFrame]:
+def _get_candles_try_all(pid: str, start_ts: int, end_ts: int, granularity: str="ONE_HOUR", limit: int=350) -> Optional[pd.DataFrame]:
+    # 1) Público
     try:
-        resp = cb_client.get_public_product_candles(
-            product_id=pid, start=str(start_ts), end=str(end_ts),
-            granularity=granularity, limit=limit
-        )
+        resp = cb_client.get_public_product_candles(product_id=pid, start=str(start_ts), end=str(end_ts), granularity=granularity, limit=limit)
         candles = getattr(resp, "candles", None) or (resp.get("candles") if isinstance(resp, dict) else None)
-        if not candles:
-            return None
-        return _candles_to_df(candles)
-    except Exception:
-        return None
+        if candles:
+            return _candles_to_df(candles)
+    except Exception as e:
+        st.debug(f"get_public_product_candles error: {e}")
+    # 2) Brokerage
+    try:
+        resp = cb_client.get_product_candles(product_id=pid, start=str(start_ts), end=str(end_ts), granularity=granularity, limit=limit)
+        candles = getattr(resp, "candles", None) or (resp.get("candles") if isinstance(resp, dict) else None)
+        if candles:
+            return _candles_to_df(candles)
+    except Exception as e:
+        st.debug(f"get_product_candles error: {e}")
+    return None
 
+def get_hourly_candles_48h(pid: str) -> Optional[pd.DataFrame]:
+    now = int(time.time())
+    return _get_candles_try_all(pid, start_ts=now - 48*3600, end_ts=now, granularity="ONE_HOUR", limit=350)
+
+def get_daily_candles_days(pid: str, days: int) -> Optional[pd.DataFrame]:
+    now = int(time.time())
+    start = now - days*86400
+    return _get_candles_try_all(pid, start_ts=start, end_ts=now, granularity="ONE_DAY", limit=400)
+
+# ---------------------
+# KPIs y tendencias intra (1H) + tendencias 3/6/12M
+# ---------------------
 def compute_indicators(df: pd.DataFrame) -> Dict[str, float]:
     closes = df["close"].astype(float)
     window = 14
@@ -209,27 +228,19 @@ def compute_trends(df48h: pd.DataFrame) -> Dict[str, str]:
     def to_label(x):
         th = 0.001
         return "up" if x > th else ("down" if x < -th else "flat")
-    return {
-        "short_term": to_label(d6),
-        "mid_term": to_label(d24),
-        "long_term": to_label(d48),
-    }
+    return {"short_term": to_label(d6), "mid_term": to_label(d24), "long_term": to_label(d48)}
 
-def build_market_context(pid: str):
-    now = int(time.time())
-    df48 = get_candles(pid, start_ts=now - 48*3600, end_ts=now, granularity="ONE_HOUR", limit=350)
-    df24 = df48.iloc[-24:].reset_index(drop=True) if df48 is not None and len(df48) >= 24 else df48
-    spot = get_spot_price(pid)
-    kpi_basic = {}
-    trends = {"short_term":"flat","mid_term":"flat","long_term":"flat"}
-    if df48 is not None and len(df48) >= 10:
-        kpi_basic = compute_indicators(df48)
-        kpi_basic["volume_change_24h_pct"] = compute_volume_change(df48)
-        trends = compute_trends(df48)
-    return spot, df24, df48, kpi_basic, trends
+def compute_pct_change(df: Optional[pd.DataFrame], lookback_days: int) -> Optional[float]:
+    if df is None or df.empty: return None
+    closes = df["close"].astype(float).reset_index(drop=True)
+    if len(closes) <= lookback_days: return None
+    try:
+        return float((closes.iloc[-1] / closes.iloc[-lookback_days-1] - 1.0) * 100.0)
+    except Exception:
+        return None
 
 # ---------------------
-# OpenAI prompt
+# OpenAI prompt (usa contexto real)
 # ---------------------
 def build_prompt(product_id: str, user_notes: str, price: Optional[float], kpis: Dict[str, float], trends: Dict[str, str]) -> list:
     system = (
@@ -251,10 +262,7 @@ Instrucciones estrictas:
 - Sizing: BUY en 'quote' (USD). SELL en 'base' (activo).
 Notas del usuario: {user_notes or "-"}
 """
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user}
-    ]
+    return [{"role": "system", "content": system},{"role": "user", "content": user}]
 
 def ask_openai_for_signal(product_id: str, user_notes: str, price: Optional[float], kpis: Dict[str, float], trends: Dict[str, str]):
     messages = build_prompt(product_id, user_notes, price, kpis, trends)
@@ -268,7 +276,7 @@ def ask_openai_for_signal(product_id: str, user_notes: str, price: Optional[floa
             "type": "json_schema",
             "json_schema": {"name": "trade_signal", "schema": schema, "strict": True}
         },
-        temperature=1,
+        temperature=0.2,
     )
     content = completion.choices[0].message.content
     data = json.loads(content)
@@ -282,7 +290,7 @@ def ask_openai_for_signal(product_id: str, user_notes: str, price: Optional[floa
     return ts
 
 # ---------------------
-# UI (paneles enriquecidos)
+# UI
 # ---------------------
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
@@ -291,7 +299,7 @@ with st.sidebar:
     user_notes = st.text_area("Notas (opcional)", value="", help="Contexto adicional para el análisis.")
     st.caption(f"Entorno Coinbase: {'SANDBOX (api-sandbox.coinbase.com)' if USE_SANDBOX or CB_BASE_URL.startswith('api-sandbox') else 'PRODUCCIÓN'}")
 
-st.write("Introduce el activo y pulsa **Analizar con OpenAI**. La UI mostrará KPIs calculados con velas 1H (hasta 48h). Si la recomendación es BUY o SELL y el producto existe en Coinbase, podrás ejecutar la orden.")
+st.write("Introduce el activo y pulsa **Analizar con OpenAI**. La app obtiene KPIs a partir de velas 1H (48h) y calcula tendencias 3/6/12 meses con velas 1D.")
 
 colA, colB = st.columns([1,1])
 with colA:
@@ -301,37 +309,59 @@ with colB:
 
 if analyze:
     with st.spinner("Calculando contexto de mercado y llamando a OpenAI…"):
-        spot, df24, df48, kpis, trends = build_market_context(product_id)
-        if spot is None and (df24 is None or df24.empty):
-            st.warning("No se pudo obtener precio/velas para el product_id indicado. Verifica el par (ej.: BTC-USD) o tus credenciales.")
+        # 1) KPIs 1H (48h)
+        df48 = get_hourly_candles_48h(product_id)
+        spot = get_spot_price(product_id)
+        kpis = {}
+        trends_intra = {"short_term":"flat","mid_term":"flat","long_term":"flat"}
+        if df48 is not None and len(df48) >= 10:
+            kpis = compute_indicators(df48)
+            kpis["volume_change_24h_pct"] = compute_volume_change(df48)
+            trends_intra = compute_trends(df48)
+
+        # 2) Tendencias 3/6/12 meses (1D)
+        df365 = get_daily_candles_days(product_id, 400)
+        chg_3m = compute_pct_change(df365, 90) if df365 is not None else None
+        chg_6m = compute_pct_change(df365, 180) if df365 is not None else None
+        chg_12m = compute_pct_change(df365, 365) if df365 is not None else None
+
         try:
-            signal = ask_openai_for_signal(product_id=product_id, user_notes=user_notes, price=spot, kpis=kpis, trends=trends)
+            signal = ask_openai_for_signal(product_id=product_id, user_notes=user_notes, price=spot, kpis=kpis, trends=trends_intra)
             st.session_state["signal"] = signal.model_dump()
             st.session_state["market"] = {
                 "spot": spot,
                 "kpis": kpis,
-                "trends": trends,
-                "df24": df24.to_dict(orient="list") if df24 is not None else None,
-                "df48": df48.to_dict(orient="list") if df48 is not None else None,
+                "trends_intra": trends_intra,
+                "chg_3m": chg_3m, "chg_6m": chg_6m, "chg_12m": chg_12m,
             }
         except Exception as e:
             st.error(f"Error al generar la señal: {e}")
 
 if "signal" in st.session_state:
-    sig = st.session_state["signal"]
-    # Re-parse to model for type safety
-    sig = TradeSignal(**sig)
+    sig = TradeSignal(**st.session_state["signal"])
     market = st.session_state.get("market", {})
 
+    # Top summary
     st.subheader("Resultado del análisis")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Acción", sig.action.upper())
     c2.metric("Confianza", f"{sig.confidence:.2f}")
     c3.metric("Horizonte (días)", sig.time_horizon_days)
     spot = market.get("spot", None)
-    c4.metric("Precio spot", f"{spot:.4f}" if isinstance(spot, (int, float)) and spot is not None else "—")
+    c4.metric("Precio actual", f"{spot:.4f}" if isinstance(spot, (int, float)) and spot is not None else "—")
 
-    left, right = st.columns([1.2, 1])
+    # Tendencias 3/6/12M
+    def trend_label(p):
+        if p is None: return "N/D"
+        th = 0.5  # % umbral
+        return "⬆️ UP" if p > th else ("⬇️ DOWN" if p < -th else "➡️ FLAT")
+    t3, t6, t12 = st.columns(3)
+    t3.metric("Tendencia 3M", f"{market.get('chg_3m'):.2f}%" if market.get("chg_3m") is not None else "N/D", trend_label(market.get("chg_3m")))
+    t6.metric("Tendencia 6M", f"{market.get('chg_6m'):.2f}%" if market.get("chg_6m") is not None else "N/D", trend_label(market.get("chg_6m")))
+    t12.metric("Tendencia 12M", f"{market.get('chg_12m'):.2f}%" if market.get("chg_12m") is not None else "N/D", trend_label(market.get("chg_12m")))
+
+    # Panels: análisis + KPIs + ejecución
+    left, right = st.columns([1.3, 1])
     with left:
         st.markdown("#### 📋 Análisis detallado")
         with st.expander("Ver análisis", expanded=True):
@@ -339,41 +369,21 @@ if "signal" in st.session_state:
         st.info(f"**Rationale:** {sig.rationale}")
         st.write(f"**Producto:** {sig.product_id}")
 
-        st.markdown("#### 📈 KPIs calculados (fuente Coinbase)")
+        st.markdown("#### 📈 KPIs (48h, velas 1H)")
         kcalc = market.get("kpis") or {}
-        if kcalc:
-            kpi_rows = [
-                ["RSI (0-100)", kcalc.get("rsi")],
-                ["MACD (line-signal)", kcalc.get("macd")],
-                ["Δ Precio 24h (%)", kcalc.get("price_change_24h_pct")],
-                ["Δ Volumen 24h (%)", kcalc.get("volume_change_24h_pct")],
-                ["Volatilidad 24h (%)", kcalc.get("volatility_24h_pct")],
-            ]
-        else:
-            kpi_rows = [["—", "No disponible"]]
-        df_kpis = pd.DataFrame(kpi_rows, columns=["KPI", "Valor"])
-        st.dataframe(df_kpis, use_container_width=True, hide_index=True)
-
-        st.markdown("#### 📊 Tendencias (calculadas 6h / 24h / 48h)")
-        arrow = {"up":"⬆️", "down":"⬇️", "flat":"➡️"}
-        trends_calc = market.get("trends") or {"short_term":"flat","mid_term":"flat","long_term":"flat"}
-        tcols = st.columns(3)
-        tcols[0].metric("Corto plazo", f"{trends_calc['short_term'].upper()} {arrow[trends_calc['short_term']]}")
-        tcols[1].metric("Medio plazo", f"{trends_calc['mid_term'].upper()} {arrow[trends_calc['mid_term']]}")
-        tcols[2].metric("Largo plazo", f"{trends_calc['long_term'].upper()} {arrow[trends_calc['long_term']]}")
-
-        df24_dict = market.get("df24")
-        if df24_dict:
-            st.markdown("#### 🕒 Últimas 24 velas (1H)")
-            df24 = pd.DataFrame(df24_dict)
-            st.dataframe(df24[["time","open","high","low","close","volume"]], use_container_width=True)
+        kpi_rows = [
+            ["RSI (0-100)", kcalc.get("rsi")],
+            ["MACD (line-signal)", kcalc.get("macd")],
+            ["Δ Precio 24h (%)", kcalc.get("price_change_24h_pct")],
+            ["Δ Volumen 24h (%)", kcalc.get("volume_change_24h_pct")],
+            ["Volatilidad 24h (%)", kcalc.get("volatility_24h_pct")],
+        ] if kcalc else [["—", "No disponible"]]
+        st.dataframe(pd.DataFrame(kpi_rows, columns=["KPI", "Valor"]), use_container_width=True, hide_index=True)
 
     with right:
         st.markdown("#### 🧮 % de recomendación (OpenAI)")
         dist = sig.recommendation_distribution
-        dist_df = pd.DataFrame(
-            {"Recomendación": ["BUY","HOLD","SELL"], "Probabilidad": [dist.buy, dist.hold, dist.sell]}
-        ).set_index("Recomendación")
+        dist_df = pd.DataFrame({"Recomendación": ["BUY","HOLD","SELL"], "Probabilidad": [dist.buy, dist.hold, dist.sell]}).set_index("Recomendación")
         st.bar_chart(dist_df, height=220, use_container_width=True)
         st.caption("Suma ≈ 1.0")
 
@@ -386,18 +396,7 @@ if "signal" in st.session_state:
                     if st.button("✅ Ejecutar BUY en Coinbase (market)", use_container_width=True):
                         try:
                             order = cb_client.market_order_buy(client_order_id=str(uuid.uuid4()), product_id=sig.product_id, quote_size=q)
-                            success = getattr(order, "success", None)
-                            order_id = None
-                            if hasattr(order, "success_response"):
-                                order_id = getattr(order.success_response, "order_id", None)
-                            else:
-                                success = success if success is not None else (order.get("success") if isinstance(order, dict) else None)
-                                if isinstance(order, dict) and "success_response" in order:
-                                    order_id = order["success_response"].get("order_id")
-                            if success:
-                                st.success(f"Orden BUY enviada ✔️ order_id={order_id or 'desconocido'}")
-                            else:
-                                st.error(f"Fallo al enviar BUY: {getattr(order, 'error_response', None) or order}")
+                            st.success(f"Orden BUY enviada. Respuesta: {order}")
                         except Exception as e:
                             st.error(f"Error al enviar BUY: {e}")
                 elif sig.action == "sell":
@@ -405,18 +404,7 @@ if "signal" in st.session_state:
                     if st.button("✅ Ejecutar SELL en Coinbase (market)", use_container_width=True):
                         try:
                             order = cb_client.market_order_sell(client_order_id=str(uuid.uuid4()), product_id=sig.product_id, base_size=b)
-                            success = getattr(order, "success", None)
-                            order_id = None
-                            if hasattr(order, "success_response"):
-                                order_id = getattr(order.success_response, "order_id", None)
-                            else:
-                                success = success if success is not None else (order.get("success") if isinstance(order, dict) else None)
-                                if isinstance(order, dict) and "success_response" in order:
-                                    order_id = order["success_response"].get("order_id")
-                            if success:
-                                st.success(f"Orden SELL enviada ✔️ order_id={order_id or 'desconocido'}")
-                            else:
-                                st.error(f"Fallo al enviar SELL: {getattr(order, 'error_response', None) or order}")
+                            st.success(f"Orden SELL enviada. Respuesta: {order}")
                         except Exception as e:
                             st.error(f"Error al enviar SELL: {e}")
             else:
