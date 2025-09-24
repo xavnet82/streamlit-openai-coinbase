@@ -358,7 +358,9 @@ def _gauge_score_from_dist(dist, action: str) -> int:
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
     symbol = st.text_input("Símbolo/Ticker (yfinance):", value="AAPL", help="Ejemplos: AAPL, MSFT, ^GSPC, BTC-USD, ^IXIC, ^IBEX")
+    deterministic = st.toggle("Deterministic mode (temp=0, seed)", value=True, help="Respuestas reproducibles del modelo")
     st.caption("Fuente de mercado: Yahoo Finance via yfinance.")
+
 
 st.write("La app descarga **1 año de datos diarios**, calcula KPIs y tendencias, y solicita a OpenAI una **recomendación y estrategia** (con parte ejecutiva + detalle técnico).")
 
