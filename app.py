@@ -1,4 +1,25 @@
 
+def _to_scalar_float(x):
+    """Convierte x a un float escalar si es posible; devuelve None si no se puede."""
+    import numpy as _np
+    import pandas as _pd
+    try:
+        arr = _np.asarray(x)
+        if arr.size == 0:
+            return None
+        val = arr.reshape(-1)[-1]
+        try:
+            return float(val)
+        except Exception:
+            val2 = _pd.to_numeric(_pd.Series([x]), errors='coerce').iloc[0]
+            return float(val2) if _pd.notna(val2) else None
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+
 # -*- coding: utf-8 -*-
 """
 Streamlit app de análisis y recomendaciones de trading con opción determinista,
@@ -395,38 +416,12 @@ with c2:
     else:
         st.info("Sin señal todavía. Pulsa **Analizar**.")
 with c3:
-    # Robust conversion of last close to a scalar float for display
-def _to_scalar_float(x):
-    import numpy as _np
-    import pandas as _pd
-    try:
-        # Convert to numpy array and squeeze to scalar if possible
-        arr = _np.asarray(x)
-        if arr.size == 0:
-            return None
-        val = arr.reshape(-1)[-1]  # take last element
-        try:
-            return float(val)
-        except Exception:
-            # try pandas to_numeric then fallback
-            val2 = _pd.to_numeric(_pd.Series([x]), errors='coerce').iloc[0]
-            return float(val2) if _pd.notna(val2) else None
-    except Exception:
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-last_close_val_raw = df['Close'].iloc[-1]
-_last_close_scalar = _to_scalar_float(last_close_val_raw)
-if _last_close_scalar is None or (isinstance(_last_close_scalar, float) and (np.isnan(_last_close_scalar))):
-    st.metric(label="Precio (último)", value="—")
-else:
-    st.metric(label="Precio (último)", value=f"{_last_close_scalar:,.2f}")
-else:
-    st.metric(label="Precio (último)", value=f"{float(last_close_val):,.2f}")
-
-
+    last_close_val_raw = df['Close'].iloc[-1]
+    _last_close_scalar = _to_scalar_float(last_close_val_raw)
+    if (_last_close_scalar is None) or (isinstance(_last_close_scalar, float) and np.isnan(_last_close_scalar)):
+        st.metric(label="Precio (último)", value="—")
+    else:
+        st.metric(label="Precio (último)", value=f"{_last_close_scalar:,.2f}")
 st.divider()
 
 # -------------------------------
