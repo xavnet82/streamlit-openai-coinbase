@@ -59,11 +59,16 @@ class RecommendationDist(BaseModel):
     hold: confloat(ge=0, le=1)
     sell: confloat(ge=0, le=1)
 
+class EntryZone(BaseModel):
+    model_config = {"extra": "forbid"}
+    lower: float
+    upper: float
+
 class Strategy(BaseModel):
     model_config = {"extra": "forbid"}
     setup_type: Literal["rebote","rotura_canal","breakout","pullback","rango","tendencia","otro"]
     narrative: str
-    entry_zone: Dict[str, float] | None = Field(default=None, description="e.g. {'lower': x, 'upper': y}")
+    entry_zone: EntryZone | None = Field(default=None, description="Rango de entrada: lower/upper")
     stop_loss: float | None = None
     take_profit: float | None = None
     risk_reward: float | None = None
@@ -83,13 +88,113 @@ class TradeSignal(BaseModel):
     recommendation_distribution: RecommendationDist
     strategy: Strategy
 
+# ---------- Explicit Strict Schema for OpenAI ----------
+def BUILD_EXPLICIT_SCHEMA():
+    # Explicit JSON Schema (OpenAI Strict) — every object has additionalProperties=false and a complete `required` list.
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "symbol": {"type": "string"},
+            "last_price": {"type": "number"},
+            "action": {"type": "string", "enum": ["buy","sell","hold"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "rationale": {"type": "string"},
+            "analysis": {"type": "string"},
+            "kpis": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "rsi14": {"type": "number", "minimum": 0, "maximum": 100},
+                    "macd_diff_12_26_9": {"type": "number"},
+                    "atr14_pct": {"type": "number"},
+                    "vola20d_annualized_pct": {"type": "number"},
+                    "ma20": {"type": "number"},
+                    "ma50": {"type": "number"},
+                    "ma200": {"type": "number"},
+                    "pct_from_ma50": {"type": "number"},
+                    "pct_from_ma200": {"type": "number"},
+                    "week52_high": {"type": "number"},
+                    "week52_low": {"type": "number"},
+                    "pct_from_52w_high": {"type": "number"},
+                    "pct_from_52w_low": {"type": "number"}
+                },
+                "required": ["rsi14","macd_diff_12_26_9","atr14_pct","vola20d_annualized_pct","ma20","ma50","ma200","pct_from_ma50","pct_from_ma200","week52_high","week52_low","pct_from_52w_high","pct_from_52w_low"]
+            },
+            "trends": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pct_3m": {"type": ["number","null"]},
+                    "pct_6m": {"type": ["number","null"]},
+                    "pct_12m": {"type": ["number","null"]},
+                    "label_3m": {"type": ["string","null"], "enum": ["up","down","flat", None]},
+                    "label_6m": {"type": ["string","null"], "enum": ["up","down","flat", None]},
+                    "label_12m": {"type": ["string","null"], "enum": ["up","down","flat", None]}
+                },
+                "required": ["pct_3m","pct_6m","pct_12m","label_3m","label_6m","label_12m"]
+            },
+            "recommendation_distribution": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "buy": {"type": "number", "minimum": 0, "maximum": 1},
+                    "hold": {"type": "number", "minimum": 0, "maximum": 1},
+                    "sell": {"type": "number", "minimum": 0, "maximum": 1}
+                },
+                "required": ["buy","hold","sell"]
+            },
+            "strategy": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "setup_type": {"type": "string", "enum": ["rebote","rotura_canal","breakout","pullback","rango","tendencia","otro"]},
+                    "narrative": {"type": "string"},
+                    "entry_zone": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "lower": {"type": "number"},
+                                    "upper": {"type": "number"}
+                                },
+                                "required": ["lower","upper"]
+                            },
+                            {"type": "null"}
+                        ]
+                    },
+                    "stop_loss": {"type": ["number","null"]},
+                    "take_profit": {"type": ["number","null"]},
+                    "risk_reward": {"type": ["number","null"]},
+                    "timeframe_days": {"type": ["integer","null"]},
+                    "key_levels": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["setup_type","narrative","entry_zone","stop_loss","take_profit","risk_reward","timeframe_days","key_levels"]
+            }
+        },
+        "required": ["symbol","last_price","action","confidence","rationale","analysis","kpis","trends","recommendation_distribution","strategy"]
+    }
+
+
+
 def _no_extra(schema: dict):
-    """Recursively set additionalProperties: false for all objects."""
+    """Recursively set additionalProperties: false and ensure `required` covers all properties.
+    This matches OpenAI Strict Structured Outputs, which demand `required` include *every* key.
+    """
     if isinstance(schema, dict):
-        if schema.get("type") == "object":
+        if schema.get("type") == "object" or (isinstance(schema.get("type"), list) and "object" in schema.get("type")):
             schema["additionalProperties"] = False
-            for v in schema.get("properties", {}).values():
-                _no_extra(v)
+            props = schema.get("properties", {})
+            if props:
+                # Force required to include all property names
+                schema["required"] = list(props.keys())
+                for v in props.values():
+                    _no_extra(v)
+        # Recurse into other fields (including anyOf/allOf/oneOf/subschemas)
         for v in schema.values():
             _no_extra(v)
     elif isinstance(schema, list):
@@ -242,13 +347,12 @@ def build_prompt(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict) -> lis
 
 def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict) -> TradeSignal:
     messages = build_prompt(symbol, df, kpis, trends)
-    schema = TradeSignal.model_json_schema()
-    _no_extra(schema)
+    schema = BUILD_EXPLICIT_SCHEMA()
     completion = oa_client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", OPENAI_MODEL),
         messages=messages,
         response_format={"type":"json_schema","json_schema":{"name":"trade_signal","schema":schema,"strict":True}},
-        temperature=1,
+        temperature=0.2,
     )
     content = completion.choices[0].message.content
     data = json.loads(content)
