@@ -118,35 +118,44 @@ def compute_trends(df: pd.DataFrame) -> Dict[str, Any]:
 def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval,
                      auto_adjust=True, progress=False)
+
     if df is None or df.empty:
         raise RuntimeError(f"No hay datos para {symbol} ({period}, {interval})")
 
-    # Aplanar MultiIndex si viene
+    # --- Aplanar MultiIndex si existe ---
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(c) for c in tup if c]) for tup in df.columns.values]
+        # Si solo hay un símbolo, quédate con el segundo nivel (ticker)
+        if len(df.columns.levels) == 2 and len(df.columns.levels[1]) == 1:
+            df.columns = df.columns.droplevel(1)
+        else:
+            # Aplana concatenando
+            df.columns = ["_".join([str(c) for c in tup if c]) for tup in df.columns.values]
 
-    # Normalizar índice
+    # --- Normalizar índice ---
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
-    # Forzar numérico
+    # --- Forzar numérico ---
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Fallback: si faltan OHLC, clonamos de Close
-    if "Close" in df.columns:
-        for col in ["Open","High","Low"]:
-            if col not in df.columns:
-                df[col] = df["Close"]
-
+    # --- Asegurar columnas OHLCV ---
+    if "Close" not in df.columns:
+        close_candidates = [c for c in df.columns if "Close" in c]
+        if close_candidates:
+            df = df.rename(columns={close_candidates[0]: "Close"})
     if "Close" not in df.columns:
         raise RuntimeError(f"No se encontró columna Close en datos de {symbol}")
 
+    for col in ["Open","High","Low","Volume"]:
+        if col not in df.columns:
+            df[col] = df["Close"]
+
+    # --- Limpiar ---
     df = df.dropna(subset=["Close"]).sort_index()
     return df
-
 
 
 
