@@ -8,6 +8,7 @@ from typing import Literal, Optional, List, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
+import logging
 from pydantic import BaseModel, Field, ValidationError, confloat
 
 # OpenAI SDK
@@ -18,6 +19,15 @@ from coinbase.rest import RESTClient
 
 st.set_page_config(page_title="Trading Assistant (OpenAI + Coinbase)", page_icon="📈", layout="wide")
 st.title("📈 Trading Assistant — OpenAI + Coinbase Advanced Trade")
+
+# Logging setup
+logger = logging.getLogger("app")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # ---------------------
 # Secrets & configuration
@@ -111,7 +121,7 @@ def get_spot_price(pid: str) -> Optional[float]:
         if price is not None:
             return float(price)
     except Exception as e:
-        st.debug(f"get_product error: {e}")
+        logger.info(f"get_product error: {e}")
     # 2) public market trades
     try:
         resp = cb_client.get_public_market_trades(product_id=pid, limit=1)
@@ -125,7 +135,7 @@ def get_spot_price(pid: str) -> Optional[float]:
             price = getattr(last, "price", None) or (last.get("price") if isinstance(last, dict) else None)
             if price: return float(price)
     except Exception as e:
-        st.debug(f"get_public_market_trades error: {e}")
+        logger.info(f"get_public_market_trades error: {e}")
     return None
 
 def _candles_to_df(candles: List[Dict]) -> pd.DataFrame:
@@ -151,7 +161,7 @@ def _get_candles_try_all(pid: str, start_ts: int, end_ts: int, granularity: str=
         if candles:
             return _candles_to_df(candles)
     except Exception as e:
-        st.debug(f"get_public_product_candles error: {e}")
+        logger.info(f"get_public_product_candles error: {e}")
     # 2) Brokerage
     try:
         resp = cb_client.get_product_candles(product_id=pid, start=str(start_ts), end=str(end_ts), granularity=granularity, limit=limit)
@@ -159,7 +169,7 @@ def _get_candles_try_all(pid: str, start_ts: int, end_ts: int, granularity: str=
         if candles:
             return _candles_to_df(candles)
     except Exception as e:
-        st.debug(f"get_product_candles error: {e}")
+        logger.info(f"get_product_candles error: {e}")
     return None
 
 def get_hourly_candles_48h(pid: str) -> Optional[pd.DataFrame]:
