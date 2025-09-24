@@ -1,6 +1,6 @@
 
 def _to_scalar_float(x):
-    """Convierte x a un float escalar si es posible; devuelve None si no se puede."""
+# """Convierte x a un float escalar si es posible; devuelve None si no se puede.""" (disabled from auto-rendering)
     import numpy as _np
     import pandas as _pd
     try:
@@ -410,7 +410,7 @@ with c2:
     # Badge + distribución (mini barras)
     if current:
         color = {"buy":"#16a34a","hold":"#f59e0b","sell":"#ef4444"}[current.action]
-        st.markdown(f'<span class="badge" style="background:{color}22;border-color:{color}33;color:{color}">{current.action.upper()}</span>',
+        st.markdown(f'<span class="badge" style="backgroundd:{color}22;border-color:{color}33;color:{color}">{current.action.upper()}</span>',
                     unsafe_allow_html=True)
         st.caption(f"Confianza: {round(current.confidence*100,1)}%")
     else:
@@ -427,15 +427,32 @@ st.divider()
 # -------------------------------
 # Gráfico de precio con medias
 # -------------------------------
-fig = go.Figure()
-fig.add_trace(go.Candlestick(
-    x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-    name="Precio"))
-fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(20).mean(), name="MA20"))
-fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(50).mean(), name="MA50"))
-fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(200).mean(), name="MA200"))
-fig.update_layout(height=420, margin=dict(l=10,r=10,b=10,t=30), xaxis_title="Fecha", yaxis_title="Precio")
-st.plotly_chart(fig, use_container_width=True)
+df_plot = df[["Open","High","Low","Close"]].dropna().copy()
+if len(df_plot) < 30:
+    st.warning("No hay suficientes datos limpios para dibujar el gráfico (mínimo 30 velas).")
+else:
+    ma20 = df_plot["Close"].rolling(20).mean()
+    ma50 = df_plot["Close"].rolling(50).mean()
+    ma200 = df_plot["Close"].rolling(200).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df_plot.index, open=df_plot["Open"], high=df_plot["High"], low=df_plot["Low"], close=df_plot["Close"],
+        name="Precio"))
+    fig.add_trace(go.Scatter(x=df_plot.index, y=ma20, name="MA20"))
+    fig.add_trace(go.Scatter(x=df_plot.index, y=ma50, name="MA50"))
+    fig.add_trace(go.Scatter(x=df_plot.index, y=ma200, name="MA200"))
+
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])  # oculta fines de semana
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10,r=10,b=10,t=30),
+        xaxis_title="Fecha",
+        yaxis_title="Precio",
+        showlegend=True
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------------------
 # Tabs de análisis
