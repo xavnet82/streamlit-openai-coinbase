@@ -1,12 +1,10 @@
 
 # -*- coding: utf-8 -*-
 """
-Streamlit app para análisis de valores con fallback determinista y gráficos robustos.
-Cambios clave respecto a tu versión:
-- Fallback local cuando no hay OPENAI_API_KEY (no se lanza excepción).
-- Limpieza y normalización de datos de yfinance (coerción a numérico y tz-naive).
-- Gráfico de velas más robusto (sin NaN, mínimo 30 velas, rangebreaks y medias móviles).
-- Estrategia por defecto con niveles (SL/TP/R:R) usando ATR cuando el modelo no devuelve niveles.
+Streamlit app con:
+- Gauge de "temperatura" BUY/HOLD/SELL (composite y mini-gauges).
+- Indicador claro de si la estrategia viene de OpenAI o del fallback local.
+- Todas las correcciones previas (normalización y fallback robusto).
 """
 import os
 import json
@@ -26,44 +24,26 @@ try:
 except Exception:
     _openai_available = False
 
-# -------------------------------
-# Configuración general de página
-# -------------------------------
-st.set_page_config(
-    page_title="Quant Assist — Señales BUY/HOLD/SELL",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="Quant Assist — Señales", page_icon="📊", layout="wide")
 
-# Estilos
 st.markdown(
     """
     <style>
-    .badge {
-        display:inline-block; padding:6px 12px; border-radius:12px;
-        border:1px solid rgba(0,0,0,0.06); font-weight:700; letter-spacing:.5px;
-    }
+    .badge {display:inline-block;padding:6px 12px;border-radius:12px;border:1px solid rgba(0,0,0,0.06);font-weight:700;letter-spacing:.5px;}
     .muted { color:#6b7280; }
+    .chip { display:inline-flex; align-items:center; gap:.5rem; padding:.25rem .6rem; border-radius:9999px; background:#f3f4f6; border:1px solid #e5e7eb; font-size:.85rem;}
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# -------------------------------
-# Utilidades base
-# -------------------------------
 def _to_scalar_float(x):
-    """Convierte valores (incluyendo Series/ndarray) a float escalar; devuelve None si no es posible."""
     try:
         arr = np.asarray(x)
         if arr.size == 0:
             return None
         val = arr.reshape(-1)[-1]
-        try:
-            return float(val)
-        except Exception:
-            val2 = pd.to_numeric(pd.Series([x]), errors='coerce').iloc[0]
-            return float(val2) if pd.notna(val2) else None
+        return float(val)
     except Exception:
         try:
             return float(x)
@@ -116,51 +96,52 @@ def compute_trends(df: pd.DataFrame) -> Dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=900)
 def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval,
-                     auto_adjust=True, progress=False)
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("No hay datos de mercado para el símbolo solicitado.")
 
-    if df is None or df.empty:
-        raise RuntimeError(f"No hay datos para {symbol} ({period}, {interval})")
-
-    # --- Aplanar MultiIndex si existe ---
+    # Aplanado de columnas si vienen en MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
-        # Si solo hay un símbolo, quédate con el segundo nivel (ticker)
-        if len(df.columns.levels) == 2 and len(df.columns.levels[1]) == 1:
-            df.columns = df.columns.droplevel(1)
-        else:
-            # Aplana concatenando
+        # Caso común: [(Open, TICKER), (High, TICKER), ...] → nos quedamos con primer nivel
+        try:
+            if len(df.columns.levels) == 2 and len(df.columns.levels[1]) == 1:
+                df.columns = df.columns.droplevel(1)
+            else:
+                df.columns = ["_".join([str(c) for c in tup if c]) for tup in df.columns.values]
+        except Exception:
             df.columns = ["_".join([str(c) for c in tup if c]) for tup in df.columns.values]
 
-    # --- Normalizar índice ---
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # Normalización: índice y tipos
+    if isinstance(df.index, pd.DatetimeIndex):
+        try:
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+        except Exception:
+            pass
+    else:
         df.index = pd.to_datetime(df.index, errors="coerce")
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
 
-    # --- Forzar numérico ---
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # --- Asegurar columnas OHLCV ---
+    # Asegurar columnas OHLCV
+    # Mapear posibles candidatos a 'Close'
     if "Close" not in df.columns:
-        close_candidates = [c for c in df.columns if "Close" in c]
-        if close_candidates:
-            df = df.rename(columns={close_candidates[0]: "Close"})
+        candidates = [c for c in df.columns if "Close" in c]
+        if candidates:
+            df = df.rename(columns={candidates[0]: "Close"})
     if "Close" not in df.columns:
-        raise RuntimeError(f"No se encontró columna Close en datos de {symbol}")
+        raise RuntimeError("No se encontró columna 'Close' tras normalización.")
 
     for col in ["Open","High","Low","Volume"]:
         if col not in df.columns:
             df[col] = df["Close"]
 
-    # --- Limpiar ---
-    df = df.dropna(subset=["Close"]).sort_index()
+    df = df.dropna(subset=["Open","High","Low","Close"]).sort_index()
     return df
 
-
-
 # -------------------------------
-# Modelos de datos (Pydantic)
+# Modelos
 # -------------------------------
 class Dist(BaseModel):
     buy: float = Field(ge=0.0)
@@ -202,9 +183,6 @@ class TradeSignal(BaseModel):
             raise ValueError("action debe ser buy|hold|sell")
         return v
 
-# -------------------------------
-# OpenAI
-# -------------------------------
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18")
 oa_client = None
 if _openai_available and os.getenv("OPENAI_API_KEY"):
@@ -267,7 +245,8 @@ def build_prompt(symbol: str, df: pd.DataFrame, kpis: Dict[str,Any], trends: Dic
     sys = {
         "role": "system",
         "content": (
-            "Eres un analista cuantitativo. Devuelve únicamente JSON válido que cumpla el schema suministrado."
+            "Eres un analista cuantitativo. Devuelve únicamente JSON válido que cumpla el schema suministrado. "
+            "Los textos deben ser específicos (evita generalidades), incluye niveles numéricos realistas."
         )
     }
     user = {
@@ -281,14 +260,14 @@ def build_prompt(symbol: str, df: pd.DataFrame, kpis: Dict[str,Any], trends: Dic
             "requirements": {
                 "action": ["buy","hold","sell"],
                 "probabilities_sum_to_one": True,
-                "sensible_levels": True
+                "sensible_levels": True,
+                "avoid_generic_text": True
             }
         }, ensure_ascii=False)
     }
     return [sys, user]
 
 def _fallback_signal(symbol: str, df: pd.DataFrame, kpis: Dict[str, Any], trends: Dict[str, Any]) -> TradeSignal:
-    # Señal determinista basada en KPIs + niveles por ATR
     last = float(df["Close"].iloc[-1])
     ma20 = float(df["Close"].rolling(20).mean().iloc[-1])
     ma50 = float(df["Close"].rolling(50).mean().iloc[-1])
@@ -301,7 +280,6 @@ def _fallback_signal(symbol: str, df: pd.DataFrame, kpis: Dict[str, Any], trends
         action, dist = "sell", {"buy":0.1,"hold":0.3,"sell":0.6}
     else:
         action, dist = "hold", {"buy":0.33,"hold":0.34,"sell":0.33}
-    # Niveles usando ATR si está disponible
     if not np.isnan(atr14) and atr14 > 0:
         if action == "buy":
             sl = last - 2*atr14
@@ -339,10 +317,10 @@ def _fallback_signal(symbol: str, df: pd.DataFrame, kpis: Dict[str, Any], trends
     }
     return TradeSignal.model_validate(ts_like)
 
-def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, deterministic: bool = True) -> TradeSignal:
-    # Si no hay cliente OpenAI, devolvemos fallback local (sin lanzar excepción).
+def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, deterministic: bool = True) -> Tuple[TradeSignal, str]:
+    # Retorna (TradeSignal, "openai"|"fallback")
     if oa_client is None:
-        return _fallback_signal(symbol, df, kpis, trends)
+        return _fallback_signal(symbol, df, kpis, trends), "fallback"
 
     schema = BUILD_EXPLICIT_SCHEMA()
     messages = build_prompt(symbol, df, kpis, trends)
@@ -358,10 +336,7 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, determin
             temperature=DEFAULT_TEMP
         )
         if OPENAI_SEED is not None:
-            try:
-                kwargs["seed"] = OPENAI_SEED
-            except Exception:
-                pass
+            kwargs["seed"] = OPENAI_SEED
         return oa_client.chat.completions.create(**kwargs)
 
     last_err = None
@@ -371,7 +346,6 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, determin
             content = completion.choices[0].message.content
             data = json.loads(content)
             ts = TradeSignal.model_validate(data)
-            # Guardrails prob sum y coherencia acción
             dist = ts.recommendation_distribution
             b, h, s = float(dist.buy), float(dist.hold), float(dist.sell)
             tot = b + h + s
@@ -388,35 +362,38 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, determin
             argmax = max(probs, key=probs.get)
             if ts.action != argmax:
                 ts.action = argmax
-            return ts
+            return ts, "openai"
         except Exception as e:
             last_err = e
 
-    # Fallback si falla OpenAI
-    return _fallback_signal(symbol, df, kpis, trends)
+    return _fallback_signal(symbol, df, kpis, trends), "fallback"
 
-# -------------------------------
-# UI — Sidebar
-# -------------------------------
+def temperature_from_probs(buy: float, hold: float, sell: float) -> float:
+    """
+    Devuelve temperatura compuesta en [0, 100]:
+    0 = extremo SELL, 50 = HOLD, 100 = extremo BUY
+    """
+    t = (buy - sell + 1.0) / 2.0  # mapea [-1,1] → [0,1]
+    return float(np.clip(t*100.0, 0, 100))
+
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
     symbol = st.text_input("Símbolo/Ticker (yfinance):", value="AAPL",
                            help="Ejemplos: AAPL, MSFT, ^GSPC, BTC-USD, ^IXIC, ^IBEX")
     period = st.selectbox("Periodo", options=["6mo","1y","2y","5y","10y"], index=1)
     interval = st.selectbox("Intervalo", options=["1d","1h","1wk"], index=0)
-    deterministic = st.toggle("Deterministic mode (temp=0, seed)", value=True,
-                              help="Mismas entradas → misma salida (si el modelo soporta seed).")
+    deterministic = st.toggle("Deterministic mode (temp=0, seed)", value=True)
+    if oa_client is None:
+        st.info("OpenAI desactivado → se usará fallback local.")
     run_btn = st.button("Analizar", type="primary", use_container_width=True)
 
-# -------------------------------
-# Lógica principal
-# -------------------------------
 if "signal" not in st.session_state:
     st.session_state["signal"] = None
 if "symbol" not in st.session_state:
     st.session_state["symbol"] = None
+if "source" not in st.session_state:
+    st.session_state["source"] = None
 
-# Datos
 try:
     df = get_data(symbol, period=period, interval=interval)
     kpis = compute_kpis(df)
@@ -425,31 +402,26 @@ except Exception as e:
     st.error(f"No se pudieron cargar datos: {e}")
     st.stop()
 
-# Ejecutar análisis
 if run_btn:
     try:
-        ts = ask_openai(symbol, df, kpis, trends, deterministic=deterministic)
+        ts, source = ask_openai(symbol, df, kpis, trends, deterministic=deterministic)
         st.session_state["signal"] = ts.model_dump()
         st.session_state["symbol"] = symbol
+        st.session_state["source"] = source
     except Exception as e:
         st.warning(f"Fallo al generar nueva señal: {e}. Se mantiene la última señal válida.")
 
-# Señal actual: si no hay ninguna, generamos una por defecto (fallback local)
 if st.session_state.get("signal") is None:
-    try:
-        ts0 = _fallback_signal(symbol, df, kpis, trends)
-        st.session_state["signal"] = ts0.model_dump()
-        st.session_state["symbol"] = symbol
-    except Exception:
-        pass
+    ts0, src0 = _fallback_signal(symbol, df, kpis, trends), "fallback"
+    st.session_state["signal"] = ts0.model_dump()
+    st.session_state["symbol"] = symbol
+    st.session_state["source"] = src0
 
 raw = st.session_state.get("signal")
 current = TradeSignal(**raw) if isinstance(raw, dict) else None
+source = st.session_state.get("source") or "fallback"
 
-# -------------------------------
-# UI — Cabecera / Estado
-# -------------------------------
-c1,c2,c3 = st.columns([2,3,2])
+c1,c2,c3,c4 = st.columns([2,2,2,2])
 with c1:
     st.markdown(f"## {symbol}")
     st.caption(f"Datos: {df.index[0].date()} → {df.index[-1].date()} • Último: {df.index[-1].date()}")
@@ -458,20 +430,17 @@ with c2:
         color = {"buy":"#16a34a","hold":"#f59e0b","sell":"#ef4444"}[current.action]
         st.markdown(f'<span class="badge" style="background-color:{color}22;border-color:{color}33;color:{color}">{current.action.upper()}</span>', unsafe_allow_html=True)
         st.caption(f"Confianza: {round(current.confidence*100,1)}%")
-    else:
-        st.info("Sin señal todavía. Pulsa **Analizar**.")
 with c3:
     last_close_val_raw = df['Close'].iloc[-1]
     _last_close_scalar = _to_scalar_float(last_close_val_raw)
-    if (_last_close_scalar is None) or (isinstance(_last_close_scalar, float) and np.isnan(_last_close_scalar)):
-        st.metric(label="Precio (último)", value="—")
-    else:
-        st.metric(label="Precio (último)", value=f"{_last_close_scalar:,.2f}")
+    st.metric(label="Precio (último)", value=f"{_last_close_scalar:,.2f}" if _last_close_scalar is not None else "—")
+with c4:
+    src_txt = "OpenAI" if source == "openai" else "Fallback (local)"
+    st.markdown(f'<span class="chip">Fuente estrategia: <b>{src_txt}</b></span>', unsafe_allow_html=True)
+
 st.divider()
 
-# -------------------------------
-# Gráfico de precio con medias
-# -------------------------------
+# ----------- Gráfico principal -----------
 df_plot = df[["Open","High","Low","Close"]].apply(pd.to_numeric, errors="coerce").dropna()
 if len(df_plot) < 30:
     st.warning("No hay suficientes datos limpios para dibujar el gráfico (mínimo 30 velas).")
@@ -487,15 +456,10 @@ else:
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma20, name="MA20"))
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma50, name="MA50"))
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma200, name="MA200"))
-    # Oculta fines de semana para daily; para intradía, Plotly gestiona automáticamente gaps por defecto
-    if str(df_plot.index.freq) in (None, "None"):
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])
     fig.update_layout(height=420, margin=dict(l=10,r=10,b=10,t=30), xaxis_title="Fecha", yaxis_title="Precio", showlegend=True)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------------------
-# Tabs de análisis
-# -------------------------------
+# ----------- Tabs -----------
 tab1, tab2, tab3 = st.tabs(["Estrategia (OpenAI)", "Probabilidades", "KPIs"])
 
 with tab1:
@@ -531,6 +495,38 @@ with tab1:
 with tab2:
     if current:
         dist = current.recommendation_distribution
+        # Gauge compuesto (0 SELL ← 50 HOLD → 100 BUY)
+        temp = temperature_from_probs(dist.buy, dist.hold, dist.sell)
+        g = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=temp,
+            number={'suffix': "%"},
+            title={'text': "Temperatura (SELL↔HOLD↔BUY)"},
+            gauge={'axis': {'range': [0, 100]},
+                   'threshold': {'line': {'width': 2}, 'thickness': 0.75, 'value': temp}}
+        ))
+        g.update_layout(height=260, margin=dict(l=10,r=10,b=10,t=30))
+        st.plotly_chart(g, use_container_width=True)
+
+        # Mini-gauges por clase
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            gg = go.Figure(go.Indicator(mode="gauge+number", value=dist.sell*100, number={'suffix': "%"},
+                                        title={'text': "SELL"}, gauge={'axis': {'range':[0,100]}}))
+            gg.update_layout(height=220, margin=dict(l=10,r=10,b=10,t=30))
+            st.plotly_chart(gg, use_container_width=True)
+        with c2:
+            gg = go.Figure(go.Indicator(mode="gauge+number", value=dist.hold*100, number={'suffix': "%"},
+                                        title={'text': "HOLD"}, gauge={'axis': {'range':[0,100]}}))
+            gg.update_layout(height=220, margin=dict(l=10,r=10,b=10,t=30))
+            st.plotly_chart(gg, use_container_width=True)
+        with c3:
+            gg = go.Figure(go.Indicator(mode="gauge+number", value=dist.buy*100, number={'suffix': "%"},
+                                        title={'text': "BUY"}, gauge={'axis': {'range':[0,100]}}))
+            gg.update_layout(height=220, margin=dict(l=10,r=10,b=10,t=30))
+            st.plotly_chart(gg, use_container_width=True)
+
+        # Barras + tabla
         d_df = pd.DataFrame({"Clase":["BUY","HOLD","SELL"], "Probabilidad":[dist.buy, dist.hold, dist.sell]})
         bar = go.Figure()
         bar.add_trace(go.Bar(x=d_df["Clase"], y=d_df["Probabilidad"]))
