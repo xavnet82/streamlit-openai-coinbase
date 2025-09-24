@@ -119,23 +119,33 @@ def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFr
     df = yf.download(symbol, period=period, interval=interval,
                      auto_adjust=True, progress=False)
     if df is None or df.empty:
-        raise RuntimeError(f"No hay datos de mercado para {symbol} con periodo={period}, interval={interval}")
-    
+        raise RuntimeError(f"No hay datos para {symbol} ({period}, {interval})")
+
+    # Si columnas son MultiIndex (ej. ("Close","AAPL")), las aplanamos
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join([str(c) for c in tup if c]) for tup in df.columns.values]
+
     # Normalizar índice
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors="coerce")
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
-    # Forzar numérico en OHLCV
-    for col in ["Open","High","Low","Close","Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    df = df.dropna(subset=["Open","High","Low","Close"]).sort_index()
-    if df.empty:
-        raise RuntimeError(f"Datos no válidos para {symbol}")
+    # Forzar numérico
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Identificar columna de cierre
+    close_candidates = [c for c in df.columns if "Close" in c]
+    if not close_candidates:
+        raise RuntimeError(f"No hay columna de cierre en datos de {symbol}")
+    # Elegir la primera
+    if "Close" not in df.columns:
+        df = df.rename(columns={close_candidates[0]: "Close"})
+
+    df = df.dropna(subset=["Close"]).sort_index()
     return df
+
 
 
 # -------------------------------
