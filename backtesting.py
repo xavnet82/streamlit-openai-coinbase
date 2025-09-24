@@ -4,8 +4,6 @@ import math
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
-import json
-
 import numpy as np
 import pandas as pd
 
@@ -228,50 +226,3 @@ def summarize(trades_df: pd.DataFrame, eq_df: pd.DataFrame) -> Dict[str, Any]:
     out["max_drawdown"] = float(max_drawdown(eq_df['equity']))
     out["sharpe"] = float(sharpe(daily))
     return out
-
-# ---------- Visualization ----------
-def plot_signals_candles(df: pd.DataFrame, signals: List[Signal], trades_df: Optional[pd.DataFrame] = None):
-    """
-    Crea una figura de velas con marcadores para señales (BUY/SELL) y, opcionalmente,
-    entradas/salidas reales de trades_df.
-    """
-    import plotly.graph_objects as go
-
-    fig = go.Figure(data=[
-        go.Candlestick(
-            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name="OHLC"
-        )
-    ])
-
-    # Señales
-    if signals:
-        # BUY markers (triangle-up) at Low - small offset
-        buy_pts_x = [s.date for s in signals if s.side == "buy" and s.date in df.index]
-        buy_pts_y = [float(df.loc[d, "Low"]) * 0.995 for d in buy_pts_x]
-        if buy_pts_x:
-            fig.add_trace(go.Scatter(
-                x=buy_pts_x, y=buy_pts_y, mode="markers",
-                marker=dict(symbol="triangle-up", size=10),
-                name="BUY signals"
-            ))
-
-        # SELL markers (triangle-down) at High + small offset
-        sell_pts_x = [s.date for s in signals if s.side == "sell" and s.date in df.index]
-        sell_pts_y = [float(df.loc[d, "High"]) * 1.005 for d in sell_pts_x]
-        if sell_pts_x:
-            fig.add_trace(go.Scatter(
-                x=sell_pts_x, y=sell_pts_y, mode="markers",
-                marker=dict(symbol="triangle-down", size=10),
-                name="SELL signals"
-            ))
-
-    # Trades (vertical entry/exit lines)
-    if trades_df is not None and not trades_df.empty:
-        for _, row in trades_df.iterrows():
-            fig.add_vline(x=row["entry_date"], line_width=1, line_dash="dot", annotation_text="Entry", annotation_position="top")
-            fig.add_vline(x=row["exit_date"],  line_width=1, line_dash="dash", annotation_text="Exit", annotation_position="top")
-
-    fig.update_layout(xaxis_rangeslider_visible=False, height=520, margin=dict(l=10, r=10, t=30, b=10))
-    return fig
-
