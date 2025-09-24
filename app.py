@@ -1,11 +1,13 @@
 
-# Nota: este archivo ha sido rehacer para corregir
-# - renderizado accidental del docstring en la cabecera (eliminado)
-# - estilos del badge (background-color)
-# - gráficos sin datos visibles (limpieza NaN, mínimo de velas, ejes con rangebreaks)
-# - robustez en métrica de último precio
-# - pequeñas incoherencias de estilo y nombres
-
+# -*- coding: utf-8 -*-
+"""
+Streamlit app para análisis de valores con fallback determinista y gráficos robustos.
+Cambios clave respecto a tu versión:
+- Fallback local cuando no hay OPENAI_API_KEY (no se lanza excepción).
+- Limpieza y normalización de datos de yfinance (coerción a numérico y tz-naive).
+- Gráfico de velas más robusto (sin NaN, mínimo 30 velas, rangebreaks y medias móviles).
+- Estrategia por defecto con niveles (SL/TP/R:R) usando ATR cuando el modelo no devuelve niveles.
+"""
 import os
 import json
 from typing import Optional, List, Dict, Any, Tuple
@@ -78,6 +80,15 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def moving_average(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window).mean()
 
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([
+        (h - l).abs(),
+        (h - c.shift(1)).abs(),
+        (l - c.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
 def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
     close = df["Close"]
     out = {
@@ -89,6 +100,7 @@ def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
         "ma50": float(moving_average(close, 50).iloc[-1]),
         "ma200": float(moving_average(close, 200).iloc[-1]),
         "rsi14": float(rsi(close, 14).iloc[-1]),
+        "atr14": float(atr(df, 14).iloc[-1])
     }
     return out
 
@@ -107,11 +119,20 @@ def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFr
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise RuntimeError("No hay datos de mercado para el símbolo solicitado.")
-    df = df.dropna().copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # Normalización: índice, tipos numéricos y limpieza de NaN
+    if isinstance(df.index, pd.DatetimeIndex):
+        try:
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+        except Exception:
+            pass
+    else:
         df.index = pd.to_datetime(df.index, errors="coerce")
-    df = df[df.index.notna()]
-    df = df.sort_index()
+    # Asegurar tipos numéricos
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
     return df
 
 # -------------------------------
@@ -242,9 +263,63 @@ def build_prompt(symbol: str, df: pd.DataFrame, kpis: Dict[str,Any], trends: Dic
     }
     return [sys, user]
 
+def _fallback_signal(symbol: str, df: pd.DataFrame, kpis: Dict[str, Any], trends: Dict[str, Any]) -> TradeSignal:
+    # Señal determinista basada en KPIs + niveles por ATR
+    last = float(df["Close"].iloc[-1])
+    ma20 = float(df["Close"].rolling(20).mean().iloc[-1])
+    ma50 = float(df["Close"].rolling(50).mean().iloc[-1])
+    ma200 = float(df["Close"].rolling(200).mean().iloc[-1])
+    rsi14 = float(kpis.get("rsi14", 50.0))
+    atr14 = float(kpis.get("atr14", np.nan))
+    if (rsi14 < 35 and last > ma50) or (ma20 > ma50 > ma200):
+        action, dist = "buy", {"buy":0.6,"hold":0.3,"sell":0.1}
+    elif (rsi14 > 65 and last < ma50) or (ma20 < ma50 < ma200):
+        action, dist = "sell", {"buy":0.1,"hold":0.3,"sell":0.6}
+    else:
+        action, dist = "hold", {"buy":0.33,"hold":0.34,"sell":0.33}
+    # Niveles usando ATR si está disponible
+    if not np.isnan(atr14) and atr14 > 0:
+        if action == "buy":
+            sl = last - 2*atr14
+            tp = last + 2*atr14
+        elif action == "sell":
+            sl = last + 2*atr14
+            tp = last - 2*atr14
+        else:
+            sl = tp = None
+        rr = None if (sl is None or tp is None) else round(abs((tp-last)/(last-sl)), 2)
+    else:
+        sl = tp = rr = None
+    strat = {
+        "setup_type": "tendencial",
+        "executive_summary": "Estrategia simple por KPIs; tamaño de posición conservador.",
+        "technical_detail": "RSI y medias móviles; sin volumen ni patrones.",
+        "entry_zone": (None, None),
+        "stop_loss": sl,
+        "take_profit": tp,
+        "risk_reward": rr,
+        "timeframe_days": 20,
+        "key_levels": [{"level": ma50, "label": "MA50"}, {"level": ma200, "label":"MA200"}]
+    }
+    ts_like = {
+        "symbol": symbol,
+        "last_price": last,
+        "action": action,
+        "confidence": 0.55,
+        "rationale": "Fallback determinista por KPIs locales ante ausencia de OpenAI o error del modelo.",
+        "analysis": "Basada en RSI/MA, tendencia y ATR para niveles.",
+        "kpis": kpis,
+        "trends": trends,
+        "recommendation_distribution": dist,
+        "strategy": strat
+    }
+    return TradeSignal.model_validate(ts_like)
+
 def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, deterministic: bool = True) -> TradeSignal:
+    # Si no hay cliente OpenAI, devolvemos fallback local (sin lanzar excepción).
     if oa_client is None:
-        raise RuntimeError("No dispongo de OpenAI API Key configurada en el entorno.")
+        return _fallback_signal(symbol, df, kpis, trends)
+
     schema = BUILD_EXPLICIT_SCHEMA()
     messages = build_prompt(symbol, df, kpis, trends)
 
@@ -272,7 +347,7 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, determin
             content = completion.choices[0].message.content
             data = json.loads(content)
             ts = TradeSignal.model_validate(data)
-            # Guardrails
+            # Guardrails prob sum y coherencia acción
             dist = ts.recommendation_distribution
             b, h, s = float(dist.buy), float(dist.hold), float(dist.sell)
             tot = b + h + s
@@ -293,47 +368,8 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict, determin
         except Exception as e:
             last_err = e
 
-    # Fallback determinista
-    last = float(df["Close"].iloc[-1])
-    ma20 = float(df["Close"].rolling(20).mean().iloc[-1])
-    ma50 = float(df["Close"].rolling(50).mean().iloc[-1])
-    ma200 = float(df["Close"].rolling(200).mean().iloc[-1])
-    rsi14 = float(kpis.get("rsi14", 50.0))
-
-    def decide():
-        if (rsi14 < 35 and last > ma50) or (ma20 > ma50 > ma200):
-            return "buy", {"buy":0.6, "hold":0.3, "sell":0.1}
-        if (rsi14 > 65 and last < ma50) or (ma20 < ma50 < ma200):
-            return "sell", {"buy":0.1, "hold":0.3, "sell":0.6}
-        return "hold", {"buy":0.33, "hold":0.34, "sell":0.33}
-
-    action, d = decide()
-    ts_like = {
-        "symbol": symbol,
-        "last_price": last,
-        "action": action,
-        "confidence": 0.55,
-        "rationale": "Fallback determinista por KPIs locales ante error del modelo.",
-        "analysis": "Basada en RSI/MA y tendencia simple.",
-        "kpis": kpis,
-        "trends": trends,
-        "recommendation_distribution": d,
-        "strategy": {
-            "setup_type": "tendencial",
-            "executive_summary": "Estrategia simple por KPIs; tamaño de posición conservador.",
-            "technical_detail": "RSI y medias móviles; sin volumen ni patrones.",
-            "entry_zone": None,
-            "stop_loss": None,
-            "take_profit": None,
-            "risk_reward": None,
-            "timeframe_days": 20,
-            "key_levels": []
-        }
-    }
-    try:
-        return TradeSignal.model_validate(ts_like)
-    except Exception as e:
-        raise RuntimeError(f"Error al generar la señal con OpenAI (y fallback): {last_err or e}")
+    # Fallback si falla OpenAI
+    return _fallback_signal(symbol, df, kpis, trends)
 
 # -------------------------------
 # UI — Sidebar
@@ -374,7 +410,15 @@ if run_btn:
     except Exception as e:
         st.warning(f"Fallo al generar nueva señal: {e}. Se mantiene la última señal válida.")
 
-# Señal actual
+# Señal actual: si no hay ninguna, generamos una por defecto (fallback local)
+if st.session_state.get("signal") is None:
+    try:
+        ts0 = _fallback_signal(symbol, df, kpis, trends)
+        st.session_state["signal"] = ts0.model_dump()
+        st.session_state["symbol"] = symbol
+    except Exception:
+        pass
+
 raw = st.session_state.get("signal")
 current = TradeSignal(**raw) if isinstance(raw, dict) else None
 
@@ -404,8 +448,7 @@ st.divider()
 # -------------------------------
 # Gráfico de precio con medias
 # -------------------------------
-df_plot = df[["Open","High","Low","Close"]].copy()
-df_plot = df_plot.dropna()
+df_plot = df[["Open","High","Low","Close"]].apply(pd.to_numeric, errors="coerce").dropna()
 if len(df_plot) < 30:
     st.warning("No hay suficientes datos limpios para dibujar el gráfico (mínimo 30 velas).")
 else:
@@ -420,7 +463,9 @@ else:
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma20, name="MA20"))
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma50, name="MA50"))
     fig.add_trace(go.Scatter(x=df_plot.index, y=ma200, name="MA200"))
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])  # oculta fines de semana para daily
+    # Oculta fines de semana para daily; para intradía, Plotly gestiona automáticamente gaps por defecto
+    if str(df_plot.index.freq) in (None, "None"):
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])
     fig.update_layout(height=420, margin=dict(l=10,r=10,b=10,t=30), xaxis_title="Fecha", yaxis_title="Precio", showlegend=True)
     st.plotly_chart(fig, use_container_width=True)
 
