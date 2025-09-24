@@ -395,7 +395,12 @@ with c2:
     else:
         st.info("Sin señal todavía. Pulsa **Analizar**.")
 with c3:
-    st.metric(label="Precio (último)", value=f"{df['Close'].iloc[-1]:,.2f}")
+    last_close_val = pd.to_numeric(df['Close'].iloc[-1], errors='coerce')
+if pd.isna(last_close_val):
+    st.metric(label="Precio (último)", value="—")
+else:
+    st.metric(label="Precio (último)", value=f"{float(last_close_val):,.2f}")
+
 
 st.divider()
 
