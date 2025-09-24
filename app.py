@@ -34,14 +34,16 @@ cb_client = RESTClient(**cb_kwargs)
 
 Action = Literal["buy", "sell", "hold"]
 class TradeSignal(BaseModel):
+    model_config = {"extra": "forbid"}
+
     product_id: str
-    action: Action
-    confidence: float
+    action: Literal["buy", "sell", "hold"]
+    confidence: float = Field(..., ge=0, le=1)
     rationale: str
     analysis: str
     size_type: Literal["quote", "base"]
     size: str
-    time_horizon_days: int
+    time_horizon_days: int = Field(..., ge=0)
 
 @st.cache_data(show_spinner=False)
 def get_product_price(pid: str) -> Optional[float]:
@@ -83,12 +85,20 @@ def ask_openai_for_signal(product_id: str, user_notes: str, price: Optional[floa
     messages = build_prompt(product_id, user_notes, price)
     schema = TradeSignal.model_json_schema()
 
+    # 👇 Requisito de Structured Outputs: schema estricto
+    # (al menos en el objeto raíz; si tuvieras objetos anidados, también allí)
+    schema["additionalProperties"] = False
+
     completion = oa_client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", OPENAI_MODEL),
         messages=messages,
         response_format={
             "type": "json_schema",
-            "json_schema": {"name": "trade_signal", "schema": schema, "strict": True}
+            "json_schema": {
+                "name": "trade_signal",
+                "schema": schema,
+                "strict": True   # mantiene el modo estricto
+            }
         },
         temperature=0.2,
     )
