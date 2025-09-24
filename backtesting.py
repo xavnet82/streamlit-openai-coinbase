@@ -1,46 +1,41 @@
-# backtesting.py — KPI-based backtesting with optional OpenAI vetting
-from __future__ import annotations
-import math
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple
 
-import json
+# -*- coding: utf-8 -*-
+"""
+Módulo de backtesting con señales técnicas y vetting opcional por OpenAI (determinista).
+Requisitos:
+    pip install pandas numpy pydantic openai==1.*
+"""
+from __future__ import annotations
+import os
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 
-# ---------- Indicators ----------
+try:
+    from openai import OpenAI
+    _openai_available = True
+except Exception:
+    _openai_available = False
+
+
+# -------------------------------
+# Señales técnicas básicas
+# -------------------------------
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, 1e-12))
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window).mean()
-
-def max_drawdown(equity: pd.Series) -> float:
-    peak = equity.cummax()
-    dd = (equity / peak) - 1.0
-    return float(dd.min()) if len(dd) else 0.0
-
-def sharpe(returns: pd.Series, periods_per_year: int = 252, rf: float = 0.0) -> float:
-    if returns.std() == 0 or returns.dropna().empty:
-        return 0.0
-    ann_ret = returns.mean() * periods_per_year
-    ann_vol = returns.std() * math.sqrt(periods_per_year)
-    return float((ann_ret - rf) / ann_vol) if ann_vol != 0 else 0.0
-
-# ---------- Signal generation ----------
 @dataclass
 class Signal:
     date: pd.Timestamp
-    side: str           # 'buy' or 'sell'
+    side: str  # "buy" | "sell"
     price: float
-    rule: str           # e.g., 'RSI<30', 'MA20>50_cross_up'
+    reason: str
 
 def generate_signals(df: pd.DataFrame,
                      use_rsi: bool = True,
@@ -48,227 +43,144 @@ def generate_signals(df: pd.DataFrame,
                      rsi_sell: float = 70.0,
                      use_ma_cross: bool = True,
                      fast_ma: int = 20,
-                     slow_ma: int = 50) -> List[Signal]:
-    """Create entry/exit *candidates* based on KPI rules."""
-    close = df['Close'].astype(float)
-    sigs: List[Signal] = []
+                     slow_ma: int = 50,
+                     rsi_entry_mode: str = "exit_oversold"  # "enter_oversold" | "exit_oversold"
+                     ) -> List[Signal]:
+    close = df["Close"]
+    signals: List[Signal] = []
 
+    # RSI
     if use_rsi:
         r = rsi(close, 14)
-        cross_up = (r.shift(1) >= rsi_buy) & (r < rsi_buy)   # entering oversold
-        cross_dn = (r.shift(1) <= rsi_sell) & (r > rsi_sell) # entering overbought
-        for ts in df.index[cross_up.fillna(False)]:
-            sigs.append(Signal(ts, 'buy', float(close.loc[ts]), f'RSI<{rsi_buy}'))
-        for ts in df.index[cross_dn.fillna(False)]:
-            sigs.append(Signal(ts, 'sell', float(close.loc[ts]), f'RSI>{rsi_sell}'))
+        if rsi_entry_mode == "enter_oversold":
+            cross_up = (r.shift(1) >= rsi_buy) & (r < rsi_buy)   # entrar en sobreventa (más agresivo)
+        else:
+            cross_up = (r.shift(1) <= rsi_buy) & (r > rsi_buy)   # salir de sobreventa (clásico)
+        cross_dn = (r.shift(1) <= rsi_sell) & (r > rsi_sell)     # entrar en sobrecompra (vender)
+        for idx in df.index[cross_up.fillna(False)]:
+            signals.append(Signal(idx, "buy", float(close.loc[idx]), "RSI"))
+        for idx in df.index[cross_dn.fillna(False)]:
+            signals.append(Signal(idx, "sell", float(close.loc[idx]), "RSI"))
 
+    # Cruce de medias
     if use_ma_cross:
-        f = sma(close, fast_ma)
-        s = sma(close, slow_ma)
-        cross_up = (f.shift(1) <= s.shift(1)) & (f > s)   # golden cross
-        cross_dn = (f.shift(1) >= s.shift(1)) & (f < s)   # death cross
-        for ts in df.index[cross_up.fillna(False)]:
-            sigs.append(Signal(ts, 'buy', float(close.loc[ts]), f'MA{fast_ma}>{slow_ma}_cross_up'))
-        for ts in df.index[cross_dn.fillna(False)]:
-            sigs.append(Signal(ts, 'sell', float(close.loc[ts]), f'MA{fast_ma}<{slow_ma}_cross_dn'))
+        fast = close.rolling(fast_ma).mean()
+        slow = close.rolling(slow_ma).mean()
+        cross_up = (fast.shift(1) <= slow.shift(1)) & (fast > slow)
+        cross_dn = (fast.shift(1) >= slow.shift(1)) & (fast < slow)
+        for idx in df.index[cross_up.fillna(False)]:
+            signals.append(Signal(idx, "buy", float(close.loc[idx]), "MA cross"))
+        for idx in df.index[cross_dn.fillna(False)]:
+            signals.append(Signal(idx, "sell", float(close.loc[idx]), "MA cross"))
 
-    sigs.sort(key=lambda s: s.date)
-    return sigs
+    # Orden cronológico
+    signals.sort(key=lambda s: (s.date, s.side))
+    return signals
 
-# ---------- OpenAI vetting (optional) ----------
-def openai_vet_signals(oa_client, model: str, symbol: str, df: pd.DataFrame, signals: List[Signal]) -> List[Dict[str, Any]]:
-    """Ask OpenAI to validate/annotate each signal; returns decisions list."""
-    if oa_client is None or model is None or not signals:
-        # Passthrough: accept all
-        return [{
-            "date": str(s.date.date() if hasattr(s.date, "date") else s.date),
-            "side": s.side, "accept": True, "reason": s.rule,
-            "stop_loss_adj": None, "take_profit_adj": None
-        } for s in signals]
 
-    decisions = []
-    for s in signals:
-        idx = df.index.get_loc(s.date)
-        start = max(0, idx - 60)
-        ctx = df.iloc[start:idx+1][["Open","High","Low","Close","Volume"]].tail(60).reset_index()
-        rows = ctx.to_dict(orient="records")
-        prompt = [
-            {"role":"system","content":"Eres un analista técnico. Valida una señal de trading y sugiere si debe operarse."},
-            {"role":"user","content":json.dumps({
-                "symbol": symbol, "signal": {"date": str(s.date), "side": s.side, "rule": s.rule, "price": s.price},
-                "recent_bars": rows[-30:]  # últimos 30 para token budget
-            }, ensure_ascii=False)}
-        ]
-        schema = {
-            "type":"object", "additionalProperties": False,
-            "properties": {
-                "accept": {"type":"boolean"},
-                "reason": {"type":"string"},
-                "stop_loss_adj": {"type":["number","null"]},
-                "take_profit_adj": {"type":["number","null"]}
-            },
-            "required": ["accept","reason","stop_loss_adj","take_profit_adj"]
-        }
+# -------------------------------
+# Vetting por OpenAI (opcional)
+# -------------------------------
+def openai_vet_signals(symbol: str,
+                       signals: List[Signal],
+                       model: str = None) -> Dict[str, str]:
+    """
+    Devuelve un diccionario {key: "accept"|"reject"} donde key = f"{date_iso}|{side}".
+    Se usa determinismo: temperature=0.0 y (si se define) seed en OPENAI_SEED.
+    Si OpenAI no está disponible o falla, acepta todas.
+    """
+    if not _openai_available or not os.getenv("OPENAI_API_KEY"):
+        return {f"{str(s.date.date())}|{s.side}": "accept" for s in signals}
+
+    client = OpenAI()
+    model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18")
+    schema = {
+        "type":"object",
+        "additionalProperties": True,
+        "properties":{}  # devolvemos mapa libre {key: "accept"/"reject"}
+    }
+    prompt_user = {
+        "role":"user",
+        "content": json_dumps_signals(symbol, signals)
+    }
+
+    kwargs = dict(
+        model=model,
+        messages=[
+            {"role":"system","content":"Devuelve un JSON con claves '<YYYY-MM-DD>|<buy|sell>' y valores 'accept' o 'reject'."},
+            prompt_user
+        ],
+        response_format={"type":"json_schema","json_schema":{"name":"backtest_decision","schema":schema,"strict":False}},
+        temperature=0.0
+    )
+    seed_env = os.getenv("OPENAI_SEED")
+    if seed_env:
         try:
-            resp = oa_client.chat.completions.create(
-                model=model,
-                messages=prompt,
-                response_format={"type":"json_schema","json_schema":{"name":"backtest_decision","schema":schema,"strict":True}},
-                temperature=1
-            )
-            data = json.loads(resp.choices[0].message.content)
-            decisions.append({"date": str(s.date), "side": s.side, **data})
-        except Exception as e:
-            decisions.append({
-                "date": str(s.date), "side": s.side, "accept": True,
-                "reason": f"auto-accept (fallback: {e})", "stop_loss_adj": None, "take_profit_adj": None
-            })
-    return decisions
+            kwargs["seed"] = int(seed_env)
+        except Exception:
+            pass
 
-# ---------- Trade simulation ----------
-@dataclass
-class Trade:
-    entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
-    side: str             # 'long' or 'short'
-    entry_price: float
-    exit_price: float
-    pnl_pct: float
-    rule: str
-    notes: str
-
-def simulate(df: pd.DataFrame,
-             signals: List[Signal],
-             sl_pct: float = 0.03,
-             tp_pct: float = 0.06,
-             capital: float = 10000.0,
-             fee_pct: float = 0.0005,
-             use_openai_decisions: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Sequential backtest: una posición a la vez, solo largos en 'buy' y cierre en 'sell' o SL/TP.
-    Devuelve (trades_df, equity_curve_df)
-    """
-    close = df['Close'].astype(float)
-    pos = None  # (entry_idx, entry_price, rule, note, dec)
-    equity = capital
-    equity_curve = []
-    trades: List[Trade] = []
-    decisions_map = {(d["date"], d["side"]): d for d in (use_openai_decisions or [])}
-
-    for i, (ts, px) in enumerate(close.items()):
-        equity_curve.append({"date": ts, "equity": equity})
-
-        # Entradas: 'buy' aceptadas
-        todays = [s for s in signals if s.date == ts and s.side == 'buy']
-        for s in todays:
-            dec = decisions_map.get((str(s.date), 'buy'))
-            accept = dec["accept"] if dec is not None else True
-            if pos is None and accept:
-                entry = px * (1 + fee_pct)
-                pos = (i, entry, s.rule, dec["reason"] if dec else s.rule, dec)
-                break
-
-        # Salidas: SL/TP o señal 'sell'
-        if pos is not None:
-            entry_i, entry_price, rule, note, dec = pos
-            this_sl = (dec["stop_loss_adj"] if dec and dec["stop_loss_adj"] is not None else (-sl_pct))  # negativo para largos
-            this_tp = (dec["take_profit_adj"] if dec and dec["take_profit_adj"] is not None else (tp_pct))
-
-            pnl_pct = (px - entry_price) / entry_price
-            exit_reason = None
-            if pnl_pct <= this_sl:
-                exit_reason = f"SL {this_sl:.2%}"
-            elif pnl_pct >= this_tp:
-                exit_reason = f"TP {this_tp:.2%}"
-
-            if exit_reason is None:
-                sells = [s for s in signals if s.date == ts and s.side == 'sell']
-                if sells:
-                    exit_reason = sells[0].rule
-
-            if exit_reason is not None:
-                exit_price = px * (1 - fee_pct)
-                trade_pnl = (exit_price - entry_price) / entry_price
-                trades.append(Trade(
-                    entry_date=df.index[entry_i], exit_date=ts, side='long',
-                    entry_price=float(entry_price), exit_price=float(exit_price),
-                    pnl_pct=float(trade_pnl), rule=rule, notes=f"{note} | {exit_reason}"
-                ))
-                equity *= (1 + trade_pnl)
-                pos = None
-
-    if pos is not None:
-        entry_i, entry_price, rule, note, _ = pos
-        px = close.iloc[-1]
-        exit_price = px * (1 - fee_pct)
-        trade_pnl = (exit_price - entry_price) / entry_price
-        trades.append(Trade(
-            entry_date=df.index[entry_i], exit_date=df.index[-1], side='long',
-            entry_price=float(entry_price), exit_price=float(exit_price),
-            pnl_pct=float(trade_pnl), rule=rule, notes=f"{note} | close_at_end"
-        ))
-
-    trades_df = pd.DataFrame([t.__dict__ for t in trades])
-    eq_df = pd.DataFrame(equity_curve)
-    return trades_df, eq_df
-
-def summarize(trades_df: pd.DataFrame, eq_df: pd.DataFrame) -> Dict[str, Any]:
-    out = {}
-    if trades_df.empty:
-        out.update({"trades": 0, "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "total_return": 0.0, "max_drawdown": 0.0, "sharpe": 0.0})
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        data = resp.choices[0].message.content
+        decisions = json.loads(data)
+        out = {}
+        for s in signals:
+            k = f"{str(s.date.date())}|{s.side}"
+            v = decisions.get(k, "accept")
+            out[k] = "accept" if str(v).lower() == "accept" else "reject"
         return out
-    wins = trades_df[trades_df['pnl_pct'] > 0]
-    losses = trades_df[trades_df['pnl_pct'] <= 0]
-    out["trades"] = len(trades_df)
-    out["win_rate"] = float(len(wins) / len(trades_df))
-    out["avg_win"] = float(wins['pnl_pct'].mean()) if not wins.empty else 0.0
-    out["avg_loss"] = float(losses['pnl_pct'].mean()) if not losses.empty else 0.0
-    out["total_return"] = float((eq_df['equity'].iloc[-1] / eq_df['equity'].iloc[0] - 1.0)) if not eq_df.empty else 0.0
-    daily = eq_df['equity'].pct_change().dropna()
-    out["max_drawdown"] = float(max_drawdown(eq_df['equity']))
-    out["sharpe"] = float(sharpe(daily))
-    return out
+    except Exception:
+        # Fallback: aceptar todo
+        return {f"{str(s.date.date())}|{s.side}": "accept" for s in signals}
 
-# ---------- Visualization ----------
-def plot_signals_candles(df: pd.DataFrame, signals: List[Signal], trades_df: Optional[pd.DataFrame] = None):
-    import plotly.graph_objects as go
-    import pandas as pd
+import json
+def json_dumps_signals(symbol: str, signals: List[Signal]) -> str:
+    compact = [
+        {"date": str(s.date.date()), "side": s.side, "price": s.price, "reason": s.reason}
+        for s in signals
+    ]
+    return json.dumps({"symbol":symbol, "signals":compact}, ensure_ascii=False)
 
-    fig = go.Figure(data=[
-        go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="OHLC")
-    ])
 
-    # Señales
-    if signals:
-        buy_pts_x = [s.date for s in signals if s.side == "buy" and s.date in df.index]
-        buy_pts_y = [float(df.loc[d, "Low"]) * 0.995 for d in buy_pts_x]
-        if buy_pts_x:
-            fig.add_trace(go.Scatter(x=buy_pts_x, y=buy_pts_y, mode="markers",
-                                     marker=dict(symbol="triangle-up", size=11), name="BUY signals"))
-        sell_pts_x = [s.date for s in signals if s.side == "sell" and s.date in df.index]
-        sell_pts_y = [float(df.loc[d, "High"]) * 1.005 for d in sell_pts_x]
-        if sell_pts_x:
-            fig.add_trace(go.Scatter(x=sell_pts_x, y=sell_pts_y, mode="markers",
-                                     marker=dict(symbol="triangle-down", size=11), name="SELL signals"))
+# -------------------------------
+# Backtest simple (buy/sell alternando)
+# -------------------------------
+def backtest(df: pd.DataFrame,
+             signals: List[Signal],
+             decisions_map: Optional[Dict[str,str]] = None,
+             fee_bps: float = 2.0) -> pd.DataFrame:
+    """
+    Backtest elemental: entra/sale en cada señal aceptada; no permite overlays.
+    fee_bps: comisiones en basis points por operación (2.0 => 0.02%).
+    """
+    cash = 1.0
+    pos = 0.0
+    last_price = float(df["Close"].iloc[0])
+    equity_curve = []
 
-    # Trades
-    if trades_df is not None and not trades_df.empty:
-        tdf = trades_df.copy()
-        tdf["entry_date"] = pd.to_datetime(tdf["entry_date"])
-        tdf["exit_date"]  = pd.to_datetime(tdf["exit_date"])
-        for _, row in tdf.iterrows():
-            fig.add_vrect(x0=row["entry_date"], x1=row["exit_date"],
-                          fillcolor="LightGreen" if row["pnl_pct"]>0 else "MistyRose",
-                          opacity=0.2, layer="below", line_width=0)
-            fig.add_vline(x=row["entry_date"], line_width=1, line_dash="dot")
-            fig.add_vline(x=row["exit_date"],  line_width=1, line_dash="dash")
-            fig.add_trace(go.Scatter(x=[row["entry_date"]], y=[row["entry_price"]],
-                                     mode="markers+text", text=["Entry"], textposition="top center",
-                                     marker=dict(symbol="star", size=10), name="Entry", showlegend=False))
-            fig.add_trace(go.Scatter(x=[row["exit_date"]], y=[row["exit_price"]],
-                                     mode="markers+text", text=["Exit"], textposition="bottom center",
-                                     marker=dict(symbol="diamond", size=10), name="Exit", showlegend=False))
+    for idx, row in df.iterrows():
+        price = float(row["Close"])
+        date_iso = str(idx.date())
 
-    fig.update_layout(xaxis_rangeslider_visible=False, height=520, margin=dict(l=10, r=10, t=30, b=10))
-    return fig
+        # Ejecutar señal si existe en este día
+        todays = [s for s in signals if str(s.date.date()) == date_iso]
+        for s in todays:
+            key = f"{date_iso}|{s.side}"
+            if decisions_map and decisions_map.get(key, "accept") != "accept":
+                continue
+            # Trade
+            if s.side == "buy" and cash > 0:
+                pos = (cash * (1 - fee_bps/1e4)) / price
+                cash = 0.0
+            elif s.side == "sell" and pos > 0:
+                cash = pos * price * (1 - fee_bps/1e4)
+                pos = 0.0
 
+        last_price = price
+        equity = cash + pos * last_price
+        equity_curve.append({"date": idx, "equity": equity})
+
+    curve = pd.DataFrame(equity_curve).set_index("date")
+    curve["ret"] = curve["equity"].pct_change().fillna(0.0)
+    return curve
