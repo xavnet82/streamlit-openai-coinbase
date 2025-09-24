@@ -61,7 +61,8 @@ def place_market_order_sell(pid: str, base_size: str):
 
 def build_prompt(product_id: str, user_notes: str, price: Optional[float]) -> list:
     system = (
-        "Eres un analista cuantitativo experto. Devuelve una recomendación operativa SIMPLE (buy/sell/hold) "
+        "Eres un analista cuantitativo experto, en trading. Analiza los datos históricos de los últimos 3, 6 y 12 meses del activo."
+        "Analiza en detalle los indicadores más relevantes (medias, volúmen etc) y devuelve una recomendación operativa SIMPLE (buy/sell/hold) "
         "y un análisis técnico claro. No uses derivados ni apalancamiento. Si la señal es débil, responde hold."
     )
     user = f"""
