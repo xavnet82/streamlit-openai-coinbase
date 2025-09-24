@@ -101,7 +101,7 @@ def ask_openai_for_signal(product_id: str, user_notes: str, price: Optional[floa
                 "strict": True   # mantiene el modo estricto
             }
         },
-        temperature=0.2,
+        temperature=1,
     )
     content = completion.choices[0].message.content
     data = json.loads(content)
