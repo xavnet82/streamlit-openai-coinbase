@@ -352,7 +352,7 @@ def ask_openai(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict) -> Trade
         model=os.getenv("OPENAI_MODEL", OPENAI_MODEL),
         messages=messages,
         response_format={"type":"json_schema","json_schema":{"name":"trade_signal","schema":schema,"strict":True}},
-        temperature=0.2,
+        temperature=1,
     )
     content = completion.choices[0].message.content
     data = json.loads(content)
