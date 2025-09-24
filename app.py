@@ -117,7 +117,7 @@ def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
         "last": float(close.iloc[-1]),
         "chg_1d": float(close.pct_change().iloc[-1]),
         "chg_5d": float(close.pct_change(5).iloc[-1]),
-        "vol_mean_20": float(df["Volume"].rolling(20).mean().iloc[-1]) if "Volume" in df else None,
+        "vol_mean_20": float(df["Volume"].rolling(20).mean().iloc[-1]) if "Volume" in df.columns else None,
         "ma20": float(moving_average(close, 20).iloc[-1]),
         "ma50": float(moving_average(close, 50).iloc[-1]),
         "ma200": float(moving_average(close, 200).iloc[-1]),
@@ -127,18 +127,25 @@ def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
 
 def compute_trends(df: pd.DataFrame) -> Dict[str, Any]:
     close = df["Close"]
-    ma20 = moving_average(close, 20).iloc[-1]
-    ma50 = moving_average(close, 50).iloc[-1]
-    ma200 = moving_average(close, 200).iloc[-1]
-    trend = "up" if ma20 > ma50 > ma200 else ("down" if ma20 < ma50 < ma200 else "sideways")
+    ma20_val = float(moving_average(close, 20).iloc[-1])
+    ma50_val = float(moving_average(close, 50).iloc[-1])
+    ma200_val = float(moving_average(close, 200).iloc[-1])
+    is_up = (ma20_val > ma50_val) and (ma50_val > ma200_val)
+    is_down = (ma20_val < ma50_val) and (ma50_val < ma200_val)
+    trend = "up" if is_up else ("down" if is_down else "sideways")
     return {"trend": trend}
 
 
 def get_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
-    if df is None or df.empty:
+    if not isinstance(df, pd.DataFrame) or df.empty:
         raise RuntimeError("No hay datos de mercado para el símbolo solicitado.")
     df = df.dropna().copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            pass
     return df
 
 
