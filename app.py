@@ -382,24 +382,28 @@ if "df" in st.session_state:
         c1, c2, c3, c4 = st.columns([1.2,1,1,1])
         if ts:
             parsed = TradeSignal(**ts) if isinstance(ts, dict) else ts
-            dist = parsed.recommendation_distribution
-            score = (dist.buy - dist.sell) * 100.0  # -100 SELL … +100 BUY
-            fig = go.Figure(go.Indicator(
-                mode = "gauge+number+delta",
-                value = score,
-                gauge = {
-                    "axis": {"range": [-100,100]},
-                    "bar": {"color": "#2B59C3"},
-                    "steps": [
-                        {"range": [-100,-33], "color":"#fee2e2"},
-                        {"range": [-33,33], "color":"#fef9c3"},
-                        {"range": [33,100], "color":"#dcfce7"},
-                    ]
-                },
-                title = {"text": f"Recomendación • {parsed.action.upper()}"},
-                number = {"suffix": ""},
-                delta = {"reference": 0}
-            ))
+             dist = parsed.recommendation_distribution
+                b = float(dist.buy or 0.0); h = float(dist.hold or 0.0); s = float(dist.sell or 0.0)
+                total = b + h + s
+                if total <= 0:
+                    total = 1.0
+                net = ((b - s) / total) * 100.0          # -100 (sell puro) … +100 (buy puro)
+                score = max(-100.0, min(100.0, net))     # clamp
+                
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number+delta",
+                    value=score,
+                    gauge={
+                        "axis": {"range": [-100, 100]},
+                        "bar": {"color": "#2B59C3"},
+                        "steps": [
+                            {"range": [-100, -33], "color": "#fee2e2"},
+                            {"range": [-33, 33],  "color": "#fef9c3"},
+                            {"range": [33, 100],  "color": "#dcfce7"},
+                        ],
+                        "threshold": {"line": {"width": 0}, "thickness": 0.0, "value": 0}  # referencia visual implícita
+                    },
+                    title={"text": f"R
             fig.update_layout(height=260, margin=dict(l=10,r=10,t=30,b=10))
             c1.plotly_chart(fig, use_container_width=True)
         else:
