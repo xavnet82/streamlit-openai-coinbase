@@ -82,8 +82,8 @@ def probs_tab(current):
     c1, c2, c3 = st.columns(3)
     for title, val, col in [("SELL", dist.sell*100, c1), ("HOLD", dist.hold*100, c2), ("BUY", dist.buy*100, c3)]:
         with col:
-            gg = go.Figure(go.Indicator(mode="gauge+number", value=val, number={'suffix': "%"},
-                                        title={'text': title}, gauge={'axis': {'range':[0,100]}}))
+            gg = go.Figure(go.Indicator(mode="gauge+number", value=val, number={'suffix': "%",  'font': {'size': 14}},
+                                        title={'text': title,  'font': {'size': 12}}, gauge={'axis': {'range':[0,100]}}))
             gg.update_layout(height=100, margin=dict(l=10,r=10,b=10,t=40))
             st.plotly_chart(gg, use_container_width=True)
 
