@@ -76,7 +76,7 @@ def probs_tab(current):
         gauge={'axis': {'range': [0, 100]},
                'threshold': {'line': {'width': 2}, 'thickness': 0.75, 'value': temp}}
     ))
-    g.update_layout(height=260, margin=dict(l=10,r=10,b=10,t=30))
+    g.update_layout(height=220, margin=dict(l=10,r=10,b=10,t=20))
     st.plotly_chart(g, use_container_width=True)
 
     c1, c2, c3 = st.columns(3)
