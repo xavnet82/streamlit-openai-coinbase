@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+
+# -*- coding: utf-8 -*-
+import os
+import streamlit as st   # <-- IMPORTA STREAMLIT ANTES DE USARLO
+import pandas as pd
+
+
+st.set_page_config(page_title="Quant Assist — Señales", page_icon="📊", layout="wide")
 # --- IMPORTS ROBUSTOS PARA QA_CORE ---
 import os, sys, importlib.util, types
 from pathlib import Path
