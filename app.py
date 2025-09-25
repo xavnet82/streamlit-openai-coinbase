@@ -8,7 +8,7 @@ from core.data import get_data
 from core.strategy import compute_kpis, compute_trends
 from core.openai_client import ask as ask_openai
 from core.models import TradeSignal
-from core.ui import header, price_chart, probs_tab
+from .core.ui import header, price_chart, probs_tab
 
 st.set_page_config(page_title="Quant Assist — Señales", page_icon="📊", layout="wide")
 
