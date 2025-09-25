@@ -76,7 +76,7 @@ def probs_tab(current):
         gauge={'axis': {'range': [0, 100]},
                'threshold': {'line': {'width': 2}, 'thickness': 0.75, 'value': temp}}
     ))
-    g.update_layout(height=210, margin=dict(l=10,r=10,b=10,t=20))
+    g.update_layout(height=220, margin=dict(l=10,r=10,b=10,t=30))
     st.plotly_chart(g, use_container_width=True)
 
     c1, c2, c3 = st.columns(3)
@@ -91,6 +91,6 @@ def probs_tab(current):
                          "Probabilidad":[dist.buy, dist.hold, dist.sell]})
     bar = go.Figure()
     bar.add_trace(go.Bar(x=d_df["Clase"], y=d_df["Probabilidad"]))
-    bar.update_layout(height=260, yaxis=dict(tickformat=".0%"), margin=dict(l=10,r=10,b=10,t=10))
+    bar.update_layout(height=220, yaxis=dict(tickformat=".0%"), margin=dict(l=10,r=10,b=10,t=20))
     st.plotly_chart(bar, use_container_width=True)
     st.dataframe(d_df.assign(Probabilidad=(d_df["Probabilidad"]*100).round(2)))
