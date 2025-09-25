@@ -7,9 +7,6 @@ from qa_core.strategy import compute_kpis, compute_trends
 from qa_core.openai_client import ask as ask_openai
 from qa_core.models import TradeSignal
 from qa_core.ui import header, price_chart, probs_tab
-import sys, os
-sys.path.append(os.path.dirname(__file__))
-
 
 st.set_page_config(page_title="Quant Assist — Señales", page_icon="📊", layout="wide")
 
