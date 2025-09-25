@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
 import streamlit as st
+import sys, os
+sys.path.append(os.path.dirname(__file__))
 import pandas as pd
 from core.data import get_data
 from core.strategy import compute_kpis, compute_trends
