@@ -76,7 +76,7 @@ def probs_tab(current):
         gauge={'axis': {'range': [0, 100]},
                'threshold': {'line': {'width': 2}, 'thickness': 0.75, 'value': temp}}
     ))
-    g.update_layout(height=100, margin=dict(l=10,r=10,b=10,t=25))
+    g.update_layout(height=120, margin=dict(l=10,r=10,b=10,t=25))
     st.plotly_chart(g, use_container_width=True)
 
     c1, c2, c3 = st.columns(3)
@@ -84,7 +84,7 @@ def probs_tab(current):
         with col:
             gg = go.Figure(go.Indicator(mode="gauge+number", value=val, number={'suffix': "%"},
                                         title={'text': title}, gauge={'axis': {'range':[0,100]}}))
-            gg.update_layout(height=80, margin=dict(l=10,r=10,b=10,t=20))
+            gg.update_layout(height=90, margin=dict(l=10,r=10,b=10,t=20))
             st.plotly_chart(gg, use_container_width=True)
 
     d_df = pd.DataFrame({"Clase":["BUY","HOLD","SELL"],
