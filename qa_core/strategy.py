@@ -60,8 +60,17 @@ def build_local_text_and_levels(df: pd.DataFrame, action:str, kpis:dict, trends:
     key_levels = [{"level": round(ma20,2), "label":"MA20"},
                   {"level": round(ma50,2), "label":"MA50"},
                   {"level": round(ma200,2), "label":"MA200"}]
+        # Entry zone
+    entry = (None, None)
+    if not np.isnan(atr14) and atr14 > 0:
+        if action == "buy":
+            entry = (round(last - atr14, 2), round(last, 2))
+        elif action == "sell":
+            entry = (round(last, 2), round(last + atr14, 2))
+
+
     return dict(executive_summary="Estrategia cuantitativa con MAs/RSI/ATR.",
-                technical_detail=txt, stop_loss=sl, take_profit=tp, timeframe_days=20, key_levels=key_levels)
+                technical_detail=txt, stop_loss=sl, take_profit=tp, timeframe_days=20, key_levels=key_levels, entry_zone=entry)
 
 def fallback_signal(symbol: str, df: pd.DataFrame, kpis: dict, trends: dict) -> TradeSignal:
     last = float(df["Close"].iloc[-1])
