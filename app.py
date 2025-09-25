@@ -1,7 +1,60 @@
 # -*- coding: utf-8 -*-
-import os
-import streamlit as st
-import pandas as pd
+# --- IMPORTS ROBUSTOS PARA QA_CORE ---
+import os, sys, importlib.util, types
+from pathlib import Path
+
+# Ruta del archivo app.py (no la cwd)
+_APP_DIR = Path(__file__).resolve().parent
+# Asegurar que la carpeta de app está en sys.path con prioridad
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
+# Estructura esperada: app.py y carpeta qa_core a su lado
+_QA_CORE_DIR = _APP_DIR / "qa_core"
+_INIT = _QA_CORE_DIR / "__init__.py"
+
+# Diagnóstico suave: si falta la carpeta o __init__.py, lo avisamos pronto
+if not _QA_CORE_DIR.exists():
+    raise ModuleNotFoundError(
+        f"No se encontró la carpeta '{_QA_CORE_DIR}'. "
+        f"Asegúrate de que 'qa_core/' esté al lado de app.py en el repo."
+    )
+if not _INIT.exists():
+    # crea un __init__.py vacío si no existe (ayuda a Streamlit Cloud)
+    _INIT.write_text("", encoding="utf-8")
+
+# Intento 1: import normal (vía sys.path)
+try:
+    from qa_core.ui import header, price_chart, probs_tab
+    from qa_core.data import get_data
+    from qa_core.strategy import compute_kpis, compute_trends
+    from qa_core.openai_client import ask as ask_openai
+    from qa_core.models import TradeSignal
+except ModuleNotFoundError:
+    # Intento 2: cargar módulos por ruta (por si el import normal no ve qa_core)
+    def _load_module(mod_name: str, file_path: Path) -> types.ModuleType:
+        spec = importlib.util.spec_from_file_location(mod_name, str(file_path))
+        if spec is None or spec.loader is None:
+            raise ModuleNotFoundError(f"No se pudo crear spec para {mod_name} ({file_path})")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    ui_mod = _load_module("qa_core.ui", _QA_CORE_DIR / "ui.py")
+    data_mod = _load_module("qa_core.data", _QA_CORE_DIR / "data.py")
+    strat_mod = _load_module("qa_core.strategy", _QA_CORE_DIR / "strategy.py")
+    oai_mod = _load_module("qa_core.openai_client", _QA_CORE_DIR / "openai_client.py")
+    models_mod = _load_module("qa_core.models", _QA_CORE_DIR / "models.py")
+
+    header, price_chart, probs_tab = ui_mod.header, ui_mod.price_chart, ui_mod.probs_tab
+    get_data = data_mod.get_data
+    compute_kpis, compute_trends = strat_mod.compute_kpis, strat_mod.compute_trends
+    ask_openai = oai_mod.ask
+    TradeSignal = models_mod.TradeSignal
+# --- FIN IMPORTS ROBUSTOS ---
+
+
 from qa_core.data import get_data
 from qa_core.strategy import compute_kpis, compute_trends
 from qa_core.openai_client import ask as ask_openai
